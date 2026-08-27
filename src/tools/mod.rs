@@ -5,6 +5,7 @@
 pub mod command;
 pub mod files;
 pub mod git;
+pub(crate) mod git_process;
 pub mod patch;
 pub mod search;
 pub mod workspace_info;

@@ -2,34 +2,30 @@
 
 use crate::config::AppState;
 use crate::error::ToolResult;
+use crate::tools::git_process::{inside_git_worktree, run_git_bounded, GitInvocation};
 use serde_json::json;
 
-/// Probe `git` for repository status and branch without disturbing it.
+/// Probe the repository branch without disturbing it, using the same hardened
+/// process rules as every other Git invocation in this server.
 fn git_probe(root: &std::path::Path) -> Option<(bool, Option<String>)> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .arg("rev-parse")
-        .arg("--is-inside-work-tree")
-        .arg("--abbrev-ref")
-        .arg("HEAD")
-        .env("GIT_OPTIONAL_LOCKS", "1")
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut lines = text.lines();
-    let is_repo = lines.next()? == "true";
-    if !is_repo {
+    if !inside_git_worktree(root) {
         return Some((false, None));
     }
-    let branch = lines
+    let out = run_git_bounded(&GitInvocation {
+        root,
+        args: &["--no-pager", "rev-parse", "--abbrev-ref", "HEAD"],
+        cap: 4 * 1024,
+        ok_exit_codes: &[0],
+    })
+    .ok()?;
+    let branch = out
+        .stdout
+        .trim()
+        .to_string()
+        .lines()
         .next()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty() && s != "HEAD");
     Some((true, branch))
 }
 
