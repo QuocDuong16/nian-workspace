@@ -235,11 +235,17 @@ pub(crate) fn read_file(state: &AppState, args: ReadFileArgs) -> ToolResult<serd
     let mut truncated_by_budget = false;
     let mut lossy = false;
     let mut current_line: u64 = 0;
-    let mut raw_buf: Vec<u8> = Vec::with_capacity(512);
 
     loop {
-        raw_buf.clear();
-        let n = read_until_inclusive(&mut reader, b'\n', &mut raw_buf)?;
+        let mut raw_buf: Vec<u8> = Vec::with_capacity(512);
+        // Bounded line read: a pathological no-newline file cannot drive
+        // allocation past max_source_line_bytes per line.
+        let (n, oversized) = read_line_bounded(
+            &mut reader,
+            b'\n',
+            &mut raw_buf,
+            limits.max_source_line_bytes,
+        )?;
         if n == 0 {
             break; // EOF
         }
@@ -261,6 +267,8 @@ pub(crate) fn read_file(state: &AppState, args: ReadFileArgs) -> ToolResult<serd
             break;
         }
         if emitted_bytes == 0 && text.len() > budget {
+            // A single line over the whole response budget: return its head
+            // (with the usual line-number prefix) and stop.
             let (clipped, _) = clip_line(
                 &text,
                 budget
@@ -273,7 +281,7 @@ pub(crate) fn read_file(state: &AppState, args: ReadFileArgs) -> ToolResult<serd
             }
             lines.push(EmittedLine {
                 number: formatted_number,
-                text: clipped,
+                text: format!("{formatted_number}: {clipped}"),
             });
             truncated_by_budget = true;
             break;
@@ -329,19 +337,57 @@ fn read_at_most(file: &mut impl Read, buf: &mut [u8]) -> ToolResult<usize> {
     Ok(filled)
 }
 
-fn read_until_inclusive(
+/// Read one delimiter-terminated line into `buf`, keeping at most
+/// `max_bytes` bytes (excess bytes for that line are consumed but dropped,
+/// so allocation stays bounded). Returns (bytes_consumed_marker, oversized)
+/// where the first element is 0 only at EOF. The returned marker counts the
+/// retained bytes plus whether the line exceeded the bound.
+fn read_line_bounded(
     reader: &mut impl BufRead,
     delim: u8,
     buf: &mut Vec<u8>,
-) -> ToolResult<usize> {
-    let before = buf.len();
-    match reader.read_until(delim, buf) {
-        Ok(n) => Ok(n),
-        Err(e) => {
-            buf.truncate(before);
-            Err(ToolError::from(e))
+    max_bytes: usize,
+) -> ToolResult<(usize, bool)> {
+    let mut consumed_any = false;
+    let mut oversized = false;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(slice) => slice,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(ToolError::from(e)),
+        };
+        if available.is_empty() {
+            // EOF.
+            return Ok((if consumed_any { 1 } else { 0 }, oversized));
+        }
+        consumed_any = true;
+        match memchr(delim, available) {
+            Some(pos) => {
+                let keep = pos.min(max_bytes.saturating_sub(buf.len()));
+                buf.extend_from_slice(&available[..keep]);
+                if pos > keep {
+                    oversized = true;
+                }
+                reader.consume(pos + 1);
+                return Ok((buf.len() + 1, oversized));
+            }
+            None => {
+                let take = available.len().min(max_bytes.saturating_sub(buf.len()));
+                buf.extend_from_slice(&available[..take]);
+                if !available.is_empty() && take < available.len() {
+                    oversized = true;
+                }
+                let len = available.len();
+                reader.consume(len);
+            }
         }
     }
+}
+
+/// Index of `needle` in `hay`, or None. Small non-cryptographic scan; a
+/// dependency-free memchr replacement is fine at these buffer sizes.
+fn memchr(needle: u8, hay: &[u8]) -> Option<usize> {
+    hay.iter().position(|&b| b == needle)
 }
 
 fn strip_eol(buf: &mut Vec<u8>) {
@@ -517,6 +563,63 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("outside the configured workspace"));
+    }
+
+    #[test]
+    fn very_long_single_line_stays_memory_bounded() {
+        // 64 MiB with no newline at all — must not allocate anywhere near
+        // that inside the reader (bound is max_source_line_bytes = 1 MiB).
+        let huge = "z".repeat(64 * 1024 * 1024);
+        let (_t, state) = fixture(huge.as_bytes());
+        let out = read_file(
+            &state,
+            ReadFileArgs {
+                path: "sample.txt".into(),
+                start_line: None,
+                end_line: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(out["line_count"], json!(1));
+        // Output still capped by the response budget, marked truncated.
+        assert_eq!(out["truncated"], json!(true));
+        let text = out["lines"][0].as_str().unwrap();
+        assert!(text.len() < limits_of(&state).max_read_bytes + 64);
+    }
+
+    #[test]
+    fn long_line_in_middle_is_clipped_without_losing_other_lines() {
+        let big = "y".repeat(3 * 1024 * 1024);
+        let content = format!("first\n{big}\nlast\n");
+        let (_t, state) = fixture(content.as_bytes());
+        let out = read_file(
+            &state,
+            ReadFileArgs {
+                path: "sample.txt".into(),
+                start_line: Some(1),
+                end_line: Some(1),
+            },
+        )
+        .unwrap();
+        assert_eq!(out["lines"][0], json!("1: first"));
+        // A follow-up read over the oversized line must not blow up either.
+        let out = read_file(
+            &state,
+            ReadFileArgs {
+                path: "sample.txt".into(),
+                start_line: Some(2),
+                end_line: Some(2),
+            },
+        )
+        .unwrap();
+        let text = out["lines"][0].as_str().unwrap();
+        assert!(text.starts_with("2: "), "oversized line rendered wrong");
+        // The byte-capped output flags truncation but stays bounded.
+        assert!(text.len() < limits_of(&state).max_read_bytes + 64);
+    }
+
+    fn limits_of(state: &AppState) -> Limits {
+        *state.limits()
     }
 
     #[test]

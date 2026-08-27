@@ -3,7 +3,7 @@
 
 use crate::config::AppState;
 use crate::error::{ToolError, ToolResult};
-use crate::tools::{clip_line, is_generated_or_vcs_dir};
+use crate::tools::is_generated_or_vcs_dir;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use rmcp::schemars;
@@ -24,10 +24,10 @@ pub struct SearchArgs {
     )]
     pub path: Option<String>,
 
-    /// Optional glob filter on file paths, e.g. "*.rs".
+    /// Optional glob filter on file paths, e.g. "*.rs" or ".env*".
     #[serde(default)]
     #[schemars(
-        description = "Optional glob filter applied to workspace-relative file paths, e.g. '*.rs'."
+        description = "Optional glob filter applied to workspace-relative file paths, e.g. '*.rs'. Hidden files are searched only when this glob matches them or when they are requested explicitly via path."
     )]
     pub glob: Option<String>,
 
@@ -49,10 +49,49 @@ pub struct SearchArgs {
     pub max_results: Option<usize>,
 }
 
+/// Search visibility rule:
+/// * generated/VCS directories (`.git`, `node_modules`, `target`, …) are
+///   always pruned, even explicitly
+/// * normal recursive search skips hidden files/directories
+/// * an explicit request rooted at a hidden path is honoured
+/// * an explicit glob may pull hidden files into a search
+fn entry_admissible(
+    entry: &walkdir::DirEntry,
+    root_is_hidden: bool,
+    glob: &Option<globset::GlobMatcher>,
+) -> bool {
+    if entry.depth() == 0 {
+        // The requested root itself is always admitted; it was resolved and
+        // authorized through the workspace resolver before walking.
+        return true;
+    }
+    let name = entry.file_name().to_string_lossy();
+    if entry.file_type().is_dir() && is_generated_or_vcs_dir(&name) {
+        return false;
+    }
+    if !name.starts_with('.') {
+        return true;
+    }
+    // Hidden entry: pruned in a normal walk...
+    if root_is_hidden {
+        // ...unless the user explicitly asked for this subtree.
+        return true;
+    }
+    if let Some(glob) = glob {
+        if glob.is_match(name.as_ref()) {
+            return true;
+        }
+    }
+    false
+}
+
 struct CollectingSink<'a> {
     max_results: usize,
     max_line_bytes: usize,
     results: &'a mut Vec<serde_json::Value>,
+    /// Set once pushing another match would exceed the caller's cap while
+    /// the underlying stream may still hold more matches.
+    hit_limit: &'a mut bool,
 }
 
 impl Sink for CollectingSink<'_> {
@@ -60,12 +99,15 @@ impl Sink for CollectingSink<'_> {
 
     fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
         if self.results.len() >= self.max_results {
-            return Ok(false); // stop searching
+            // Explicitly tracked stop condition — no reliance on grep's
+            // error-kind signalling downstream.
+            *self.hit_limit = true;
+            return Ok(false); // stop searching this file
         }
         let line_no = mat.line_number().unwrap_or(0);
         let raw = String::from_utf8_lossy(mat.bytes());
         let trimmed = raw.trim_end_matches(['\n', '\r']);
-        let (text, was_clipped) = clip_line(trimmed, self.max_line_bytes);
+        let (text, was_clipped) = crate::tools::clip_line(trimmed, self.max_line_bytes);
         self.results.push(json!({
             "line": line_no,
             "text": text,
@@ -110,6 +152,20 @@ pub(crate) fn handle(state: &AppState, args: SearchArgs) -> ToolResult<serde_jso
         _ => None,
     };
 
+    // Hidden-root searches are explicit requests: the client navigated into
+    // hidden territory by naming it (e.g. path=".config"), so hidden entries
+    // inside that subtree are intentional. Decided from the *requested*
+    // argument, never the absolute location — a workspace merely living
+    // under a dot-directory stays a normal workspace.
+    let root_is_hidden = match args.path.as_deref() {
+        Some(requested) => std::path::Path::new(requested)
+            .components()
+            .any(|c| {
+                matches!(c, std::path::Component::Normal(name) if name.to_string_lossy().starts_with('.'))
+            }),
+        None => false,
+    };
+
     let pattern = if args.literal {
         regex::escape(args.query.trim())
     } else {
@@ -130,10 +186,10 @@ pub(crate) fn handle(state: &AppState, args: SearchArgs) -> ToolResult<serde_jso
     let mut truncated = false;
 
     // Single-file search is the degenerate case of the walker below.
-    for entry in WalkDir::new(&target)
+    'outer: for entry in WalkDir::new(&target)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| entry_admissible(e, &target))
+        .filter_entry(|e| entry_admissible(e, root_is_hidden, &glob_set))
     {
         let entry = match entry {
             Ok(e) => e,
@@ -159,19 +215,15 @@ pub(crate) fn handle(state: &AppState, args: SearchArgs) -> ToolResult<serde_jso
         files_searched += 1;
 
         let path_buf = PathBuf::from(entry.path());
+        let mut hit_limit = false;
         let sink = CollectingSink {
             max_results,
             max_line_bytes: limits.max_search_line_bytes,
             results: &mut results,
+            hit_limit: &mut hit_limit,
         };
-        // A search error of kind Other is the sink's stop signal when the
-        // result cap was hit mid-file.
         match searcher.search_path(&matcher, &path_buf, sink) {
             Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::Other && results.len() >= max_results => {
-                truncated = true;
-                break;
-            }
             Err(err) => {
                 tracing::warn!(
                     "search: failed on {}: {err}",
@@ -179,8 +231,11 @@ pub(crate) fn handle(state: &AppState, args: SearchArgs) -> ToolResult<serde_jso
                 );
             }
         }
-        if results.len() >= max_results {
-            break;
+        if hit_limit && results.len() >= max_results {
+            // The cap was reached mid-search; more matches may exist in this
+            // file or later ones, so report truncation explicitly.
+            truncated = true;
+            break 'outer;
         }
     }
 
@@ -195,19 +250,122 @@ pub(crate) fn handle(state: &AppState, args: SearchArgs) -> ToolResult<serde_jso
     }))
 }
 
-/// Prune generated/VCS directories; keep hidden files searchable only when
-/// they are explicitly requested via glob (dot-dirs are always pruned).
-fn entry_admissible(entry: &walkdir::DirEntry, root: &std::path::Path) -> bool {
-    if entry.depth() == 0 {
-        return true;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Limits;
+    use crate::permissions::Permissions;
+    use crate::workspace::Workspace;
+    use tempfile::TempDir;
+
+    fn state(root: &std::path::Path) -> AppState {
+        AppState::new(
+            Workspace::open(root).unwrap(),
+            Permissions::default(),
+            Limits::default(),
+        )
     }
-    let name = entry.file_name().to_string_lossy();
-    if name.starts_with('.') {
-        return false;
+
+    fn args(query: &str) -> SearchArgs {
+        SearchArgs {
+            query: query.into(),
+            path: None,
+            glob: None,
+            ignore_case: false,
+            literal: false,
+            max_results: None,
+        }
     }
-    if entry.file_type().is_dir() && is_generated_or_vcs_dir(&name) {
-        return false;
+
+    #[test]
+    fn result_limit_sets_truncated_flag() {
+        let tmp = TempDir::new().unwrap();
+        // 50 files x 10 matches = 500 hits; cap at 7.
+        for i in 0..50 {
+            std::fs::write(tmp.path().join(format!("f{i}.txt")), "needle\n".repeat(10)).unwrap();
+        }
+        let st = state(tmp.path());
+        let mut a = args("needle");
+        a.max_results = Some(7);
+        let out = handle(&st, a).unwrap();
+        assert_eq!(out["match_count"], json!(7));
+        assert_eq!(
+            out["truncated"],
+            json!(true),
+            "cap reached with more matches present must report truncated"
+        );
     }
-    let _ = root;
-    true
+
+    #[test]
+    fn exhaustive_search_is_not_truncated() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "hit one\nmiss\nhit two\n").unwrap();
+        let st = state(tmp.path());
+        let out = handle(&st, args("hit")).unwrap();
+        assert_eq!(out["match_count"], json!(2));
+        assert_eq!(out["truncated"], json!(false));
+    }
+
+    #[test]
+    fn hidden_files_are_skipped_unless_glob_or_path_selects_them() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("normal.txt"), "secret_token\n").unwrap();
+        std::fs::write(tmp.path().join(".env"), "secret_token=1\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".config")).unwrap();
+        std::fs::write(tmp.path().join(".config/creds.txt"), "secret_token\n").unwrap();
+
+        let st = state(tmp.path());
+
+        // Default: hidden entries excluded entirely.
+        let out = handle(&st, args("secret_token")).unwrap();
+        assert_eq!(out["files_searched"], json!(1));
+        assert_eq!(out["matches"][0]["text"], json!("secret_token"));
+
+        // A glob explicitly naming the hidden file includes it — the hit now
+        // comes from .env instead of the visible file.
+        let mut a = args("secret_token");
+        a.glob = Some(".env*".into());
+        let out = handle(&st, a).unwrap();
+        assert_eq!(out["files_searched"], json!(1));
+        assert_eq!(
+            out["matches"][0]["text"],
+            json!("secret_token=1"),
+            "hidden .env was searched because the glob named it"
+        );
+
+        // Explicit hidden directory root is searched.
+        let mut a = args("secret_token");
+        a.path = Some(".config".into());
+        let out = handle(&st, a).unwrap();
+        assert_eq!(out["files_searched"], json!(1));
+        assert_eq!(out["match_count"], json!(1));
+
+        // .git is never searched even when a broad glob is given.
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join(".git/leaked.txt"), "secret_token\n").unwrap();
+        let mut a = args("secret_token");
+        a.glob = Some("*".into());
+        let out = handle(&st, a).unwrap();
+        assert_eq!(
+            out["files_searched"].as_u64().unwrap(),
+            3,
+            "must see normal.txt + .env + .config/creds.txt — but never .git/leaked.txt"
+        );
+    }
+
+    #[test]
+    fn generated_directories_still_skipped() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(
+            tmp.path().join("node_modules/pkg/index.js"),
+            "targetstring\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("src.rs"), "targetstring\n").unwrap();
+        let st = state(tmp.path());
+        let out = handle(&st, args("targetstring")).unwrap();
+        assert_eq!(out["files_searched"], json!(1));
+        assert_eq!(out["matches"][0]["line"], json!(1));
+    }
 }

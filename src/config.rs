@@ -25,6 +25,10 @@ pub struct Limits {
     pub max_search_results_cap: usize,
     /// Maximum bytes for a single matched search line kept in output.
     pub max_search_line_bytes: usize,
+    /// Hard internal ceiling on one source line's size while reading a file
+    /// (before any output clipping). Guards against multi-gigabyte
+    /// single-line inputs driving unbounded Vec growth in read_file.
+    pub max_source_line_bytes: usize,
     /// run_command stdout cap in bytes.
     pub max_command_stdout: usize,
     /// run_command stderr cap in bytes.
@@ -47,6 +51,7 @@ impl Default for Limits {
             default_search_results: 100,
             max_search_results_cap: 1_000,
             max_search_line_bytes: 300,
+            max_source_line_bytes: 1024 * 1024,
             max_command_stdout: 256 * 1024,
             max_command_stderr: 256 * 1024,
             default_command_timeout_secs: 120,
