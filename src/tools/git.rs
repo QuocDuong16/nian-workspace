@@ -49,7 +49,7 @@ pub(crate) fn git_status(state: &AppState, _args: GitStatusArgs) -> ToolResult<s
 
     Ok(json!({
         "output": out.stdout,
-        "truncated": out.truncated,
+        "truncated": out.stdout_truncated,
     }))
 }
 
@@ -103,7 +103,7 @@ pub(crate) fn git_diff(state: &AppState, args: GitDiffArgs) -> ToolResult<serde_
         "staged": args.staged,
         "path": resolved_path,
         "diff": out.stdout,
-        "truncated": out.truncated,
+        "truncated": out.stdout_truncated,
     }))
 }
 

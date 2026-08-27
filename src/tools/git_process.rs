@@ -17,6 +17,7 @@
 //!   discarded with fixed-size reads instead of accumulating in memory
 
 use crate::error::{ToolError, ToolResult};
+use crate::tools::CappedBytes;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -53,7 +54,12 @@ const HARDENED_CONFIG: &[&str] = &[
 #[derive(Debug)]
 pub(crate) struct GitOutput {
     pub stdout: String,
-    pub truncated: bool,
+    /// Whether user-visible stdout bytes were actually discarded
+    /// (independent of stderr; a successful tool's public `truncated`
+    /// reflects only this).
+    pub stdout_truncated: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub stderr_truncated: bool,
 }
 
 /// One hardened git invocation: fixed root, fixed subcommand args, output
@@ -103,13 +109,21 @@ pub(crate) fn run_git_bounded(invocation: &GitInvocation<'_>) -> ToolResult<GitO
 
     let cap = invocation.cap;
     let drain_stderr = std::thread::spawn(move || collect_capped(&mut stderr_pipe, cap));
-    let (stdout_bytes, read_err) = collect_capped(&mut stdout_pipe, cap);
+    let (stdout_capped, read_err) = collect_capped(&mut stdout_pipe, cap);
     if let Some(e) = read_err {
         let _ = child.kill();
         let _ = drain_stderr.join();
         return Err(ToolError::msg(format!("Failed reading git output: {e}")));
     }
-    let (stderr_bytes, _) = drain_stderr.join().unwrap_or((Vec::new(), None));
+    let (stderr_capped, _) = drain_stderr.join().unwrap_or_else(|_| {
+        (
+            crate::tools::CappedBytes {
+                bytes: Vec::new(),
+                truncated: false,
+            },
+            None,
+        )
+    });
 
     let status = child
         .wait()
@@ -117,17 +131,18 @@ pub(crate) fn run_git_bounded(invocation: &GitInvocation<'_>) -> ToolResult<GitO
     let exit_code = status.code().unwrap_or(-1);
 
     if !invocation.ok_exit_codes.contains(&exit_code) {
-        let stderr_text = crate::tools::decode_lossy(&stderr_bytes).0;
+        let stderr_text = crate::tools::decode_lossy(&stderr_capped.bytes).0;
         return Err(ToolError::msg(format!(
             "git exited with code {exit_code}: {}",
             stderr_text.trim()
         )));
     }
 
-    let (stdout, _) = crate::tools::decode_lossy(&stdout_bytes);
+    let (stdout, _) = crate::tools::decode_lossy(&stdout_capped.bytes);
     Ok(GitOutput {
         stdout,
-        truncated: stdout_bytes.len() >= cap || stderr_bytes.len() >= cap,
+        stdout_truncated: stdout_capped.truncated,
+        stderr_truncated: stderr_capped.truncated,
     })
 }
 
@@ -144,22 +159,42 @@ pub(crate) fn inside_git_worktree(root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Read at most `cap` bytes from `pipe`; once full, continue draining to EOF
-/// discarding everything in fixed-size chunks (never grows past `cap`).
-/// Returns (bytes, io_error_if_any).
-fn collect_capped(pipe: &mut impl Read, cap: usize) -> (Vec<u8>, Option<std::io::Error>) {
-    let mut bytes: Vec<u8> = Vec::with_capacity(cap.min(64 * 1024));
-    let mut chunk = [0u8; 16 * 1024];
-    loop {
-        match pipe.read(&mut chunk) {
-            Ok(0) => return (bytes, None),
-            Ok(n) => {
-                let take = n.min(cap.saturating_sub(bytes.len()));
-                bytes.extend_from_slice(&chunk[..take]);
-                // Past the cap: discard the rest chunk-wise, no allocation.
+/// Read at most `cap` bytes from `pipe` into a bounded buffer; once full,
+/// keep draining to EOF in fixed-size chunks, discarding everything else.
+///
+/// `truncated` means bytes were actually discarded: output ending exactly at
+/// the cap is NOT truncation — only content past the cap sets the flag.
+fn collect_capped(pipe: &mut impl Read, cap: usize) -> (CappedBytes, Option<std::io::Error>) {
+    fn read_impl(pipe: &mut dyn Read, cap: usize) -> std::io::Result<CappedBytes> {
+        let mut out = CappedBytes {
+            bytes: Vec::with_capacity(cap.min(64 * 1024)),
+            truncated: false,
+        };
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            match pipe.read(&mut chunk)? {
+                0 => return Ok(out),
+                n => {
+                    let take = n.min(cap.saturating_sub(out.bytes.len()));
+                    out.bytes.extend_from_slice(&chunk[..take]);
+                    if take < n {
+                        // A real discard happened; the only source of truth
+                        // for the truncation flag.
+                        out.truncated = true;
+                    }
+                }
             }
-            Err(e) => return (bytes, Some(e)),
         }
+    }
+    match read_impl(pipe, cap) {
+        Ok(capped) => (capped, None),
+        Err(e) => (
+            CappedBytes {
+                bytes: Vec::new(),
+                truncated: false,
+            },
+            Some(e),
+        ),
     }
 }
 
@@ -226,5 +261,56 @@ mod tests {
             pinned.iter().any(|(k, v)| k == "PAGER" && v == "cat"),
             "pagers must be disabled via environment too"
         );
+    }
+}
+
+#[cfg(test)]
+mod collector_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn collect(data: &[u8], cap: usize) -> CappedBytes {
+        let mut cursor = Cursor::new(data.to_vec());
+        collect_capped(&mut cursor, cap).0
+    }
+
+    #[test]
+    fn under_cap_is_not_truncated() {
+        let c = collect(b"hello", 100);
+        assert_eq!(c.bytes, b"hello");
+        assert!(!c.truncated);
+    }
+
+    #[test]
+    fn exactly_at_cap_is_not_truncated() {
+        // Ending precisely at the cap is NOT truncation — nothing discarded.
+        let data: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        let c = collect(&data, 4096);
+        assert_eq!(c.bytes.len(), 4096);
+        assert!(!c.truncated, "exact-cap output must not be flagged");
+    }
+
+    #[test]
+    fn one_byte_past_cap_is_truncated_and_retains_exactly_cap() {
+        let data = vec![b'x'; 4097];
+        let c = collect(&data, 4096);
+        assert_eq!(c.bytes.len(), 4096);
+        assert!(c.truncated, "any discarded byte must set the flag");
+    }
+
+    #[test]
+    fn far_over_cap_discards_rest_in_fixed_chunks() {
+        let data = vec![b'y'; 1_000_000];
+        let c = collect(&data, 999);
+        assert_eq!(c.bytes.len(), 999);
+        assert!(c.truncated);
+        assert!(c.bytes.iter().all(|&b| b == b'y'));
+    }
+
+    #[test]
+    fn zero_cap_retains_nothing_but_flags_input_present() {
+        let c = collect(b"abc", 0);
+        assert_eq!(c.bytes.len(), 0);
+        assert!(c.truncated, "discarded 'abc' is real truncation");
     }
 }
