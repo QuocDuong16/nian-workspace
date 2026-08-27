@@ -1,0 +1,7 @@
+# Toolchain pins for nian-workspace (managed by mise).
+# Overrides the global ~/.config/mise/config.toml for this repository only.
+# rust-toolchain.toml additionally pins the Rust channel for direct cargo
+# invocations that bypass mise (editors, CI containers).
+
+[tools]
+rust = "1.98.0"
