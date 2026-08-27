@@ -36,7 +36,7 @@ nian-workspace [WORKSPACE] [OPTIONS]
 | `--exec` | Allow executing local programs (`run_command`) |
 | `--allow-shell` | Allow commands through a system shell; requires `--exec` |
 | `--transport <stdio\|http>` | MCP transport (default: `stdio`) |
-| `--host <HOST>` | HTTP bind host (default: `127.0.0.1`; never bind a public address unintentionally) |
+| `--host <HOST>` | HTTP bind host — loopback only (`127.0.0.1`, `::1`, or `localhost`); non-loopback addresses are rejected |
 | `--port <PORT>` | HTTP port (default: `8787`) |
 | `--log-level <LEVEL>` | `error`, `warn`, `info`, `debug` (or set `RUST_LOG`) |
 
@@ -61,8 +61,8 @@ nian-workspace . --write --exec --allow-shell  # + shell syntax (cmd.exe / /bin/
 | `search` | ✔ | Regex or literal, ripgrep-like semantics, capped results |
 | `git_status` | ✔ | `git status --short --branch` equivalent |
 | `git_diff` | ✔ | Unstaged or staged diff, optional path filter, bounded |
-| `apply_patch` | ✗ needs `--write` | Unified diff (`diff -u` / `git diff`). Atomic per call: failed hunks write nothing. New-file creation via `/dev/null` headers; renames/deletions rejected. |
-| `run_command` | ✗ needs `--exec` | Direct process execution (`program` + `args`), no shell interpolation. Optional `shell:true` requests need `--allow-shell`. Timeout kills the process; stdout/stderr are capped. |
+| `apply_patch` | ✗ needs `--write` | Unified diff (`diff -u` / `git diff`). All hunks are validated before mutation, and each individual file replacement is atomic; an unexpected filesystem failure during the commit phase may leave a multi-file patch partially applied. New-file creation via `/dev/null` headers; renames/deletions rejected. Preserves existing newline style (LF/CRLF) and POSIX permission bits. |
+| `run_command` | ✗ needs `--exec` | Direct process execution (`program` + `args`), no shell interpolation. Optional `shell:true` requests need `--allow-shell`. Timeout terminates the whole process tree on Unix and Windows; stdout/stderr are capped. |
 
 ## Client setup
 
@@ -105,7 +105,9 @@ Read this before enabling flags.
 - **Workspace isolation** covers every filesystem-facing tool (`list_files`, `read_file`, `search`, `apply_patch`, `run_command` cwd, `git_diff` path). Requests containing `../` traversal, absolute paths outside the root, drive-letter tricks, or symlinks that resolve outside the root are rejected with explicit errors — including paths whose final component does not exist yet.
 - **`--allow-shell` is a separate flag because shell execution is strictly more dangerous**: `/bin/sh` (Unix) or `cmd.exe` (Windows) interprets the whole command line, enabling chaining, redirection, and expansion. It also requires `--exec`.
 - **Outputs are bounded** (~256 KiB per channel by default) with truncation metadata, so large logs and dumps cannot flood model context.
-- **HTTP mode binds to loopback** unless you explicitly pass another host. There is no authentication layer; anything that can reach the port can use the enabled tools against your filesystem.
+- **HTTP mode is loopback-only.** Non-loopback bind addresses (`0.0.0.0`, LAN IPs) are rejected at startup: there is no authentication layer, so anything that can reach the port can use the enabled tools against your filesystem. For remote access, put an external secure tunnel (TLS/auth) in front of `127.0.0.1`.
+- **Command output is truly bounded**: stdout/stderr are retained up to their caps and everything past them is discarded in fixed-size chunks; a timeout terminates the entire process tree (process group on Unix, Job Object on Windows), best-effort.
+- **Git tools are hardened for read-only use**: `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_EXTERNAL_DIFF` and similar environment redirection is stripped per invocation, pagers are disabled, and repository- or user-configured external diff, textconv, and fsmonitor execution paths are turned off (`--no-ext-diff`, `--no-textconv`, `-c core.fsmonitor=false`).
 
 No security guarantees beyond these mechanisms are made. Do not overstate them in deployments.
 
@@ -119,6 +121,12 @@ cargo build --release
 ```
 
 CI runs the same gates on Forgejo (see `.forgejo/workflows/quality.yml`), pinned to Rust 1.98.0 in a Linux container — matching `rust-toolchain.toml`, so local builds and CI use the same toolchain.
+
+### Platform support and CI honesty
+
+CI performs full native validation (fmt, clippy, tests, release build) on Linux.
+
+Windows, macOS (x64 and ARM64), and Linux ARM64 targets receive compile-time cross-target `cargo check` validation from the same Linux Forgejo/DinD runner. Native Windows/macOS runtime testing is not currently available because the project does not have native runners for those operating systems — the foreign binaries are never executed in CI.
 
 ## License
 
