@@ -272,17 +272,45 @@ fn atomic_write(target: &Path, bytes: &[u8]) -> ToolResult<()> {
         .map_err(|e| ToolError::msg(format!("Failed to flush temp file: {e}")))?;
 
     // Preserve existing permission bits so, e.g., an executable script
-    // stays executable after being patched (POSIX platforms only).
+    // stays executable after being patched (POSIX platforms only). A
+    // failure to apply the preserved mode aborts the replacement: dropping
+    // `tmp` deletes it, so the original file remains untouched — README
+    // promises preservation, so either keep the bits or fail clearly.
     #[cfg(unix)]
-    if let Ok(meta) = std::fs::metadata(target) {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = meta.permissions().mode();
-        let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode));
+    match std::fs::metadata(target) {
+        Ok(meta) => {
+            use std::os::unix::fs::PermissionsExt;
+            apply_preserved_mode(tmp.path(), meta.permissions().mode())?;
+        }
+        // New file (creation patch): default exclusive-temp permissions apply.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(ToolError::msg(format!(
+                "Cannot stat '{}' to preserve its permissions: {e}",
+                target.display()
+            )))
+        }
     }
 
     tmp.persist(target)
         .map_err(|e| ToolError::msg(format!("Failed to replace '{}': {e}", target.display())))?;
     Ok(())
+}
+
+/// Carry `mode` over to the replacement file at `dest`. Any failure is an
+/// error — never silently ignored — so the caller aborts BEFORE persisting
+/// and the original file stays untouched.
+#[cfg(unix)]
+fn apply_preserved_mode(dest: &Path, mode: u32) -> ToolResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dest, std::fs::Permissions::from_mode(mode)).map_err(|e| {
+        ToolError::msg(format!(
+            "Failed to preserve permission mode {:o} on replacement for '{}': {e}. \
+             Original file left unchanged.",
+            mode,
+            dest.display()
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -908,6 +936,24 @@ mod tests {
     }
 
     // -- permission preservation (review pass #9, Unix-only) -----------------
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_preservation_failure_is_surfaced_not_ignored() {
+        // The contract is "keep the bits or fail loudly", never "silently
+        // lose the bits and persist anyway". Point the mode-application step
+        // at a path that cannot exist so set_permissions fails, and require
+        // a clear error naming the preserved mode.
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("no-such-tmp-file");
+        let err = apply_preserved_mode(&missing, 0o755).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Failed to preserve permission mode"),
+            "set_permissions failure must be surfaced: {}",
+            err
+        );
+    }
 
     #[cfg(unix)]
     #[test]
