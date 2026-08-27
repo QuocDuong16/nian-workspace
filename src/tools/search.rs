@@ -86,6 +86,9 @@ fn entry_admissible(
 }
 
 struct CollectingSink<'a> {
+    /// Workspace-relative path of the file being searched, attached to every
+    /// match so results identify their source across multiple files.
+    file_path: String,
     max_results: usize,
     max_line_bytes: usize,
     results: &'a mut Vec<serde_json::Value>,
@@ -109,6 +112,7 @@ impl Sink for CollectingSink<'_> {
         let trimmed = raw.trim_end_matches(['\n', '\r']);
         let (text, was_clipped) = crate::tools::clip_line(trimmed, self.max_line_bytes);
         self.results.push(json!({
+            "path": self.file_path,
             "line": line_no,
             "text": text,
             "clipped": was_clipped,
@@ -215,8 +219,10 @@ pub(crate) fn handle(state: &AppState, args: SearchArgs) -> ToolResult<serde_jso
         files_searched += 1;
 
         let path_buf = PathBuf::from(entry.path());
+        let rel_file_path = ws.display_relative(&path_buf);
         let mut hit_limit = false;
         let sink = CollectingSink {
+            file_path: rel_file_path,
             max_results,
             max_line_bytes: limits.max_search_line_bytes,
             results: &mut results,
@@ -367,5 +373,45 @@ mod tests {
         let out = handle(&st, args("targetstring")).unwrap();
         assert_eq!(out["files_searched"], json!(1));
         assert_eq!(out["matches"][0]["line"], json!(1));
+    }
+
+    #[test]
+    fn every_match_carries_workspace_relative_path() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/auth")).unwrap();
+        std::fs::write(tmp.path().join("src/auth/login.rs"), "handle_login();\n").unwrap();
+        std::fs::write(
+            tmp.path().join("src/logout.rs"),
+            "handle_logout();\nhandle_login_admin();\n",
+        )
+        .unwrap();
+
+        let st = state(tmp.path());
+        let out = handle(&st, args("handle_")).unwrap();
+        let matches = out["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 3);
+
+        // File visit order is unspecified; look hits up per file.
+        let login: Vec<_> = matches
+            .iter()
+            .filter(|m| m["path"] == json!("src/auth/login.rs"))
+            .collect();
+        assert_eq!(login.len(), 1);
+        assert_eq!(login[0]["line"], json!(1));
+        assert_eq!(login[0]["text"], json!("handle_login();"));
+
+        let logout: Vec<_> = matches
+            .iter()
+            .filter(|m| m["path"] == json!("src/logout.rs"))
+            .collect();
+        assert_eq!(logout.len(), 2);
+        assert_eq!(logout[0]["line"], json!(1));
+        assert_eq!(logout[0]["text"], json!("handle_logout();"));
+        assert_eq!(logout[1]["line"], json!(2));
+        for m in matches {
+            let p = m["path"].as_str().unwrap();
+            assert!(!p.starts_with('/'), "absolute path leaked: {p}");
+            assert!(!p.contains(".."), "traversal leaked: {p}");
+        }
     }
 }
