@@ -66,7 +66,7 @@ impl NianWorkspaceServer {
     }
 
     #[tool(
-        description = "Fast regex/literal text search over workspace files with ripgrep-like output (path, line number, matching line). Results are bounded."
+        description = "Fast regex/literal text search over workspace files: every match reports its workspace-relative path and line number. Results are bounded; .git/.hg/.svn are never searched, generated dirs only when requested explicitly."
     )]
     fn search(
         &self,

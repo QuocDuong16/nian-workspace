@@ -3,7 +3,7 @@
 
 use crate::config::AppState;
 use crate::error::{ToolError, ToolResult};
-use crate::tools::is_generated_or_vcs_dir;
+use crate::tools::{is_generated_dir, is_vcs_metadata_dir};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use rmcp::schemars;
@@ -17,10 +17,10 @@ pub struct SearchArgs {
     #[schemars(description = "Literal text or regular expression (Rust syntax) to search for.")]
     pub query: String,
 
-    /// Directory or file to search, relative to the workspace root. Defaults to the whole workspace.
+    /// Directory or file to search, relative to the workspace root. Defaults to the whole workspace. VCS metadata (.git/.hg/.svn) is never searchable; explicitly requesting a generated directory (node_modules, target, ...) is allowed.
     #[serde(default)]
     #[schemars(
-        description = "Directory or file to search, relative to the workspace root. Defaults to the whole workspace."
+        description = "Directory or file to search, relative to the workspace root. Defaults to the whole workspace. Version-control metadata (.git/.hg/.svn) is rejected; explicitly requesting a generated directory such as node_modules is allowed."
     )]
     pub path: Option<String>,
 
@@ -49,32 +49,34 @@ pub struct SearchArgs {
     pub max_results: Option<usize>,
 }
 
-/// Search visibility rule:
-/// * generated/VCS directories (`.git`, `node_modules`, `target`, …) are
-///   always pruned, even explicitly
-/// * normal recursive search skips hidden files/directories
-/// * an explicit request rooted at a hidden path is honoured
-/// * an explicit glob may pull hidden files into a search
+/// Search visibility policy (see handle() for the root-level rules):
+/// * VCS metadata directories are pruned ALWAYS, anywhere in the walk
+/// * ordinary generated directories are pruned in a normal recursive search,
+///   admitted when the user explicitly rooted the search (subtree "as-is")
+/// * hidden entries behave like before: skipped unless explicitly selected
+///   (explicit path into hidden territory, or a glob naming them)
 fn entry_admissible(
     entry: &walkdir::DirEntry,
-    root_is_hidden: bool,
+    explicit_root: bool,
     glob: &Option<globset::GlobMatcher>,
 ) -> bool {
     if entry.depth() == 0 {
-        // The requested root itself is always admitted; it was resolved and
-        // authorized through the workspace resolver before walking.
+        // The requested root was already screened by handle(): it exists
+        // inside the workspace and is not VCS metadata.
         return true;
     }
     let name = entry.file_name().to_string_lossy();
-    if entry.file_type().is_dir() && is_generated_or_vcs_dir(&name) {
-        return false;
+    if entry.file_type().is_dir() && is_vcs_metadata_dir(&name) {
+        return false; // even under an explicitly requested subtree
     }
     if !name.starts_with('.') {
+        if entry.file_type().is_dir() && is_generated_dir(&name.as_ref()) {
+            return explicit_root;
+        }
         return true;
     }
-    // Hidden entry: pruned in a normal walk...
-    if root_is_hidden {
-        // ...unless the user explicitly asked for this subtree.
+    // Hidden entry.
+    if explicit_root {
         return true;
     }
     if let Some(glob) = glob {
@@ -156,19 +158,35 @@ pub(crate) fn handle(state: &AppState, args: SearchArgs) -> ToolResult<serde_jso
         _ => None,
     };
 
-    // Hidden-root searches are explicit requests: the client navigated into
-    // hidden territory by naming it (e.g. path=".config"), so hidden entries
-    // inside that subtree are intentional. Decided from the *requested*
-    // argument, never the absolute location — a workspace merely living
-    // under a dot-directory stays a normal workspace.
-    let root_is_hidden = match args.path.as_deref() {
+    // Policy decided from the *requested* argument (never the absolute
+    // location — a workspace merely living under a dot-directory stays a
+    // normal workspace):
+    //
+    // A. VCS metadata (.git/.hg/.svn) is rejected outright, even as the root.
+    // B. An explicit request roots the search "as-is": hidden entries and
+    //    ordinary generated directories inside that subtree are admitted;
+    //    nested VCS metadata remains pruned by the walker below.
+    let requested_components: Vec<String> = match args.path.as_deref() {
         Some(requested) => std::path::Path::new(requested)
             .components()
-            .any(|c| {
-                matches!(c, std::path::Component::Normal(name) if name.to_string_lossy().starts_with('.'))
-            }),
-        None => false,
+            .filter_map(|c| match c {
+                std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect(),
+        None => Vec::new(),
     };
+
+    if let Some(vcs_dir) = requested_components.iter().find(|c| is_vcs_metadata_dir(c)) {
+        return Err(ToolError::msg(format!(
+            "'{}' lies inside version-control metadata ('{vcs_dir}'); \
+             the search tool never inspects VCS internals.",
+            args.path.as_deref().unwrap_or_default()
+        )));
+    }
+
+    // Explicit path => user steered the search deliberately (hidden + generated included).
+    let explicit_root = !requested_components.is_empty();
 
     let pattern = if args.literal {
         regex::escape(args.query.trim())
@@ -193,7 +211,7 @@ pub(crate) fn handle(state: &AppState, args: SearchArgs) -> ToolResult<serde_jso
     'outer: for entry in WalkDir::new(&target)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| entry_admissible(e, root_is_hidden, &glob_set))
+        .filter_entry(|e| entry_admissible(e, explicit_root, &glob_set))
     {
         let entry = match entry {
             Ok(e) => e,
@@ -373,6 +391,81 @@ mod tests {
         let out = handle(&st, args("targetstring")).unwrap();
         assert_eq!(out["files_searched"], json!(1));
         assert_eq!(out["matches"][0]["line"], json!(1));
+    }
+
+    // -- explicit generated / VCS boundary policy ----------------------------
+
+    #[test]
+    fn explicit_generated_directory_is_searchable() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("node_modules/left-pad")).unwrap();
+        std::fs::write(
+            tmp.path().join("node_modules/left-pad/index.js"),
+            "marker_here\n",
+        )
+        .unwrap();
+        // Outside the requested subtree a generated dir stays pruned.
+        std::fs::create_dir_all(tmp.path().join("target/debug")).unwrap();
+        std::fs::write(tmp.path().join("target/debug/artifact"), "marker_here\n").unwrap();
+
+        let st = state(tmp.path());
+        let mut a = args("marker_here");
+        a.path = Some("node_modules".into());
+        let out = handle(&st, a).expect("explicit node_modules path must be allowed");
+        assert_eq!(out["match_count"], json!(1));
+        let p = out["matches"][0]["path"].as_str().unwrap();
+        assert!(p.starts_with("node_modules/"), "unexpected match path: {p}");
+    }
+
+    #[test]
+    fn explicit_vcs_metadata_roots_are_rejected() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git/refs")).unwrap();
+        std::fs::write(tmp.path().join(".git/config"), "[core]\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".hg")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".svn")).unwrap();
+        let st = state(tmp.path());
+
+        for attempt in [".git", ".git/refs", ".hg", ".svn"] {
+            let mut a = args("core");
+            a.path = Some(attempt.into());
+            let err = handle(&st, a).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("version-control metadata"),
+                "'{attempt}' must be rejected with the VCS message, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_search_never_enters_git_even_via_glob() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("top.txt"), "needle_nested_git\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git/objects/pack")).unwrap();
+        std::fs::write(
+            tmp.path().join(".git/objects/pack/found.txt"),
+            "needle_nested_git\n",
+        )
+        .unwrap();
+        let st = state(tmp.path());
+
+        let mut a = args("needle_nested_git");
+        a.glob = Some("*".into());
+        let out = handle(&st, a).unwrap();
+        assert!(
+            !serde_json::to_string(&out).unwrap().contains(".git"),
+            ".git content leaked into results: {out}"
+        );
+
+        // The only conceivable route to .git content — an explicit root — is
+        // rejected outright by handle().
+        let mut a = args("needle_nested_git");
+        a.path = Some(".git".into());
+        assert!(
+            handle(&st, a).is_err(),
+            "explicit .git root must be rejected"
+        );
     }
 
     #[test]

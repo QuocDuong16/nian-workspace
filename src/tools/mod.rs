@@ -13,12 +13,15 @@ pub mod workspace_info;
 use crate::error::ToolError;
 use rmcp::model::{CallToolResult, ContentBlock};
 
-/// Directories that are skipped by `list_files` and `search` in addition to
-/// standard ignore handling. Kept deliberately small.
+/// Version-control metadata directories. These are never searched by the
+/// search tool — not even when explicitly requested as a path (policy:
+/// exposing `.git` internals adds no value and complicates the model).
+pub(crate) const VCS_METADATA_DIRS: &[&str] = &[".git", ".hg", ".svn"];
+
+/// Ordinary generated/build directories skipped during normal recursive
+/// searches. Explicitly requesting such a path IS allowed (`node_modules`,
+/// `target`, …) — clients may legitimately need to inspect dependency trees.
 pub(crate) const GENERATED_DIRS: &[&str] = &[
-    ".git",
-    ".hg",
-    ".svn",
     "node_modules",
     "target",
     "__pycache__",
@@ -30,8 +33,17 @@ pub(crate) const GENERATED_DIRS: &[&str] = &[
     "coverage",
 ];
 
-pub(crate) fn is_generated_or_vcs_dir(name: &str) -> bool {
+pub(crate) fn is_vcs_metadata_dir(name: &str) -> bool {
+    VCS_METADATA_DIRS.contains(&name)
+}
+
+pub(crate) fn is_generated_dir(name: &str) -> bool {
     GENERATED_DIRS.contains(&name)
+}
+
+/// Kept for listing/pruning call sites that treat both kinds alike.
+pub(crate) fn is_generated_or_vcs_dir(name: &str) -> bool {
+    is_vcs_metadata_dir(name) || is_generated_dir(name)
 }
 
 /// Render a successful tool response with both structured content and a

@@ -58,7 +58,7 @@ nian-workspace . --write --exec --allow-shell  # + shell syntax (cmd.exe / /bin/
 | `workspace_info` | ✔ | Root, name, permissions, Git branch |
 | `list_files` | ✔ | Bounded depth, glob filter, skips `.git`/`node_modules`/`target`/… |
 | `read_file` | ✔ | 1-based line ranges, binary detection, bounded output |
-| `search` | ✔ | Regex or literal, ripgrep-like semantics, capped results |
+| `search` | ✔ | Regex or literal, capped results, every match carries its workspace-relative path. `.git`/`.hg`/`.svn` are never searched — even when requested explicitly; generated dirs (`node_modules`, `target`, …) are skipped normally but searchable when you ask for them by path. |
 | `git_status` | ✔ | `git status --short --branch` equivalent |
 | `git_diff` | ✔ | Unstaged or staged diff, optional path filter, bounded |
 | `apply_patch` | ✗ needs `--write` | Unified diff (`diff -u` / `git diff`). All hunks are validated before mutation, and each individual file replacement is atomic; an unexpected filesystem failure during the commit phase may leave a multi-file patch partially applied. New-file creation via `/dev/null` headers; renames/deletions rejected. Preserves existing newline style (LF/CRLF) and POSIX permission bits. |
