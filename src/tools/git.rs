@@ -35,9 +35,14 @@ pub(crate) fn git_status(state: &AppState, _args: GitStatusArgs) -> ToolResult<s
     let ws = state.workspace();
     let cap = state.limits().max_git_output;
 
+    // Pathspec "-- ." is the workspace-boundary guarantee: when the
+    // workspace is a subdirectory of a larger repository, plain `status`
+    // would report changes for the WHOLE repository (git discovers the repo
+    // root upward). Restricting to "." keeps output inside the configured
+    // workspace, no matter where the enclosing repo extends.
     let out = run_git_bounded(&GitInvocation {
         root: ws.root(),
-        args: &["--no-pager", "status", "--short", "--branch"],
+        args: &["--no-pager", "status", "--short", "--branch", "--", "."],
         cap,
         ok_exit_codes: &[0],
     })?;
@@ -66,6 +71,11 @@ pub(crate) fn git_diff(state: &AppState, args: GitDiffArgs) -> ToolResult<serde_
     // --no-ext-diff / --no-textconv make it impossible for a crafted
     // repository (diff.external, diff.<driver>.textconv in .git/config or
     // attributes) to execute an external program during our diff.
+    //
+    // Trailing pathspec: a specific workspace-relative path when given
+    // (already validated through Workspace::resolve), otherwise "." — the
+    // same scoping rule as git_status. ../ or absolute external pathspecs
+    // never reach this point.
     let mut cmd_args: Vec<&str> = vec![
         "--no-pager",
         "diff",
@@ -76,9 +86,10 @@ pub(crate) fn git_diff(state: &AppState, args: GitDiffArgs) -> ToolResult<serde_
     if args.staged {
         cmd_args.push("--cached");
     }
-    if let Some(rel) = &resolved_path {
-        cmd_args.push("--");
-        cmd_args.push(rel.as_str());
+    cmd_args.push("--");
+    match &resolved_path {
+        Some(rel) => cmd_args.push(rel.as_str()),
+        None => cmd_args.push("."),
     }
 
     let out = run_git_bounded(&GitInvocation {
@@ -117,17 +128,15 @@ mod tests {
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
 
-    /// Point every git child at empty global/system config so results cannot
-    /// depend on the CI host's ~/.gitconfig (e.g. status.showUntrackedFiles).
-    /// Idempotent and race-free: all writers set identical values.
-    fn isolate_host_config() {
-        std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
-        std::env::set_var("GIT_CONFIG_SYSTEM", "/dev/null");
-        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
-    }
-
+    /// Fixture git invocations deliberately avoid mutating process-wide
+    /// environment variables (unsafe racy across parallel tests). Where a
+    /// test needs to pin behavior the host ~/.gitconfig could otherwise
+    /// influence, the fixture pins it as REPO-LOCAL config (which outranks
+    /// global config) instead.
+    ///
+    /// Identity comes from Command-scoped env below; that is per-child state,
+    /// not process state, and is therefore race-free.
     fn git(dir: &Path, args: &[&str]) {
-        isolate_host_config();
         let out = StdCommand::new("git")
             .arg("-C")
             .arg(dir)
@@ -146,10 +155,19 @@ mod tests {
         );
     }
 
+    /// Pin behaviors a hostile/benign host gitconfig could otherwise flip.
+    fn pin_local_config(repo_root: &Path) {
+        git(
+            repo_root,
+            &["config", "status.showUntrackedFiles", "normal"],
+        );
+    }
+
     fn repo_state() -> (TempDir, AppState) {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         git(root, &["init", "--initial-branch=main"]);
+        pin_local_config(root);
         std::fs::write(root.join("tracked.txt"), "line one\nline two\n").unwrap();
         git(root, &["add", "."]);
         git(root, &["commit", "-m", "initial"]);
@@ -160,7 +178,6 @@ mod tests {
 
     #[test]
     fn status_shows_branch_and_clean_tree() {
-        isolate_host_config();
         let (_t, state) = repo_state();
         let out = git_status(&state, GitStatusArgs {}).expect("status should succeed");
         let output = out["output"].as_str().unwrap();
@@ -176,7 +193,6 @@ mod tests {
 
     #[test]
     fn status_reports_untracked_and_modified_files() {
-        isolate_host_config();
         let (_t, state) = repo_state();
         std::fs::write(state.workspace().root().join("new.txt"), b"x\n").unwrap();
         std::fs::write(
@@ -199,7 +215,6 @@ mod tests {
 
     #[test]
     fn diff_shows_unstaged_changes() {
-        isolate_host_config();
         let (_t, state) = repo_state();
         std::fs::write(
             state.workspace().root().join("tracked.txt"),
@@ -225,7 +240,6 @@ mod tests {
 
     #[test]
     fn staged_flag_uses_cached_diff() {
-        isolate_host_config();
         let (_t, state) = repo_state();
         let root = state.workspace().root();
         std::fs::write(root.join("tracked.txt"), b"line one\nSTAGED\n").unwrap();
@@ -255,7 +269,6 @@ mod tests {
 
     #[test]
     fn diff_can_be_restricted_to_one_path() {
-        isolate_host_config();
         let (_t, state) = repo_state();
         let root = state.workspace().root();
         std::fs::write(root.join("tracked.txt"), b"line one\nXXX\n").unwrap();
@@ -279,7 +292,6 @@ mod tests {
 
     #[test]
     fn tools_fail_outside_a_git_repository() {
-        isolate_host_config();
         let tmp = TempDir::new().unwrap();
         let ws = Workspace::open(tmp.path()).unwrap();
         let state = AppState::new(ws, Permissions::default(), Limits::default());
@@ -299,12 +311,12 @@ mod tests {
 
     #[test]
     fn malicious_repo_config_cannot_execute_external_diff() {
-        isolate_host_config();
         // Configure an external diff driver that would create a marker file
         // if executed; git_status/git_diff must NOT run it.
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         git(root, &["init", "--initial-branch=main"]);
+        pin_local_config(root);
         std::fs::write(root.join("payload.txt"), "before\n").unwrap();
         git(root, &["add", "."]);
         git(root, &["commit", "-m", "initial"]);
@@ -352,69 +364,13 @@ mod tests {
     }
 
     #[test]
-    fn environment_redirection_is_ignored() {
-        isolate_host_config();
-        // GIT_DIR/GIT_WORK_TREE pointing elsewhere must not redirect our
-        // queries away from the workspace repository. The helper strips
-        // these variables for every child it spawns.
-        let (tmp_a, state_a) = repo_state();
-        let tmp_b = TempDir::new().unwrap();
-        git(tmp_b.path(), &["init", "--initial-branch=main"]);
-        std::fs::write(tmp_b.path().join("decoy.txt"), "decoy\n").unwrap();
-        git(tmp_b.path(), &["add", "."]);
-        git(
-            tmp_b.path(),
-            &[
-                "-c",
-                "user.email=t@example.com",
-                "-c",
-                "user.name=t",
-                "commit",
-                "-m",
-                "x",
-            ],
-        );
-
-        let prev_dir = std::env::var("GIT_DIR").ok();
-        let prev_tree = std::env::var("GIT_WORK_TREE").ok();
-        std::env::set_var("GIT_DIR", tmp_b.path().join(".git").display().to_string());
-        std::env::set_var("GIT_WORK_TREE", tmp_b.path().display().to_string());
-
-        let result = git_status(&state_a, GitStatusArgs {});
-
-        // Restore before asserting so failure paths don't poison other tests.
-        match (prev_dir, prev_tree) {
-            (Some(d), Some(t)) => {
-                std::env::set_var("GIT_DIR", d);
-                std::env::set_var("GIT_WORK_TREE", t);
-            }
-            _ => {
-                std::env::remove_var("GIT_DIR");
-                std::env::remove_var("GIT_WORK_TREE");
-            }
-        }
-
-        let out = result.expect("status should succeed despite redirection env");
-        let output = out["output"].as_str().unwrap();
-        assert!(
-            output.contains("## main"),
-            "wrong repository queried: {output}"
-        );
-        assert!(
-            !output.contains("decoy"),
-            "env redirected the query: {output}"
-        );
-        drop(tmp_a);
-    }
-
-    #[test]
     fn oversized_git_output_is_bounded() {
-        isolate_host_config();
         // A file large enough that its diff exceeds a tiny cap must still be
         // processed without unbounded retention, reporting truncation.
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         git(root, &["init", "--initial-branch=main"]);
+        pin_local_config(root);
         let big_before = "x\n".repeat(1_000);
         std::fs::write(root.join("big.txt"), big_before).unwrap();
         git(root, &["add", "."]);
@@ -445,7 +401,6 @@ mod tests {
 
     #[test]
     fn nonzero_git_exit_becomes_an_error() {
-        isolate_host_config();
         let (_t, state) = repo_state();
         // Ask the hardened runner directly with a command that fails when its
         // exit code is not accepted. `git status --unsupported-flag` exits 129.
@@ -462,5 +417,149 @@ mod tests {
             msg.contains("git exited with code"),
             "expected exit-code error, got: {msg}"
         );
+    }
+
+    // -- workspace-boundary scope (parent repository) ------------------------
+
+    /// Parent repo layout:
+    ///
+    /// ```text
+    /// repo/
+    /// ├── outside.txt      (outside the configured workspace)
+    /// └── workspace/
+    ///     └── inside.txt   (the workspace root)
+    /// ```
+    fn parent_repo_state() -> (TempDir, AppState) {
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path();
+        let ws_dir = repo_root.join("workspace");
+        std::fs::create_dir(&ws_dir).unwrap();
+        git(repo_root, &["init", "--initial-branch=main"]);
+        pin_local_config(repo_root);
+        std::fs::write(repo_root.join("outside.txt"), "original\n").unwrap();
+        std::fs::write(ws_dir.join("inside.txt"), "original\n").unwrap();
+        git(repo_root, &["add", "."]);
+        git(repo_root, &["commit", "-m", "initial"]);
+
+        let ws = Workspace::open(&ws_dir).unwrap();
+        let state = AppState::new(ws, Permissions::default(), Limits::default());
+        (tmp, state)
+    }
+
+    #[test]
+    fn status_excludes_changes_outside_the_workspace() {
+        let (_t, state) = parent_repo_state();
+        let repo_root = state.workspace().root().join("..");
+        std::fs::write(repo_root.join("outside.txt"), "MODIFIED OUTSIDE\n").unwrap();
+        std::fs::write(
+            state.workspace().root().join("inside.txt"),
+            "modified inside\n",
+        )
+        .unwrap();
+
+        let out = git_status(&state, GitStatusArgs {}).expect("status must succeed");
+        let output = out["output"].as_str().unwrap();
+        assert!(
+            output.contains("inside.txt"),
+            "workspace change missing from status: {output}"
+        );
+        assert!(
+            !output.contains("outside.txt"),
+            "OUT-OF-WORKSPACE change leaked into status: {output}"
+        );
+    }
+
+    #[test]
+    fn diff_excludes_changes_outside_the_workspace() {
+        let (_t, state) = parent_repo_state();
+        let repo_root = state.workspace().root().join("..");
+        std::fs::write(repo_root.join("outside.txt"), "DIFFED OUTSIDE\n").unwrap();
+        std::fs::write(
+            state.workspace().root().join("inside.txt"),
+            "diffed inside\n",
+        )
+        .unwrap();
+
+        let out = git_diff(
+            &state,
+            GitDiffArgs {
+                staged: false,
+                path: None,
+            },
+        )
+        .expect("diff must succeed");
+        let diff = out["diff"].as_str().unwrap();
+        assert!(
+            diff.contains("+diffed inside"),
+            "expected inside change: {diff}"
+        );
+        assert!(
+            !diff.contains("+DIFFED OUTSIDE") && !diff.contains("outside.txt"),
+            "out-of-workspace change leaked into diff: {diff}"
+        );
+    }
+
+    #[test]
+    fn staged_diff_is_also_workspace_scoped() {
+        let (_t, state) = parent_repo_state();
+        let repo_root = state.workspace().root().join("..");
+        std::fs::write(repo_root.join("outside.txt"), "STAGED OUTSIDE\n").unwrap();
+        std::fs::write(
+            state.workspace().root().join("inside.txt"),
+            "staged inside\n",
+        )
+        .unwrap();
+        // Stage everything in the whole repository.
+        git(state.workspace().root(), &["add", ":/"]);
+
+        let out = git_diff(
+            &state,
+            GitDiffArgs {
+                staged: true,
+                path: None,
+            },
+        )
+        .unwrap();
+        let diff = out["diff"].as_str().unwrap();
+        assert!(
+            diff.contains("+staged inside"),
+            "expected inside change: {diff}"
+        );
+        assert!(
+            !diff.contains("+STAGED OUTSIDE") && !diff.contains("outside.txt"),
+            "out-of-workspace staged change leaked: {diff}"
+        );
+
+        // Unstaged view stays empty — the only staged change inside the
+        // workspace is what we just created.
+        let unstaged = git_diff(
+            &state,
+            GitDiffArgs {
+                staged: false,
+                path: None,
+            },
+        )
+        .unwrap();
+        assert!(unstaged["diff"].as_str().unwrap().trim().is_empty());
+    }
+
+    #[test]
+    fn explicit_diff_path_may_not_reference_outside_paths() {
+        let (_t, state) = parent_repo_state();
+        for attempt in ["../outside.txt", "/etc/passwd"] {
+            let err = git_diff(
+                &state,
+                GitDiffArgs {
+                    staged: false,
+                    path: Some(attempt.into()),
+                },
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Invalid diff path") || msg.contains("outside the configured"),
+                "'{attempt}' should be rejected as a pathspec, got: {msg}"
+            );
+        }
     }
 }

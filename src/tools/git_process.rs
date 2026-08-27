@@ -162,3 +162,69 @@ fn collect_capped(pipe: &mut impl Read, cap: usize) -> (Vec<u8>, Option<std::io:
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Structural guarantee: every hardened command strips the environment
+    /// variables that could redirect git into another repository or an
+    /// external-program execution path, regardless of what the parent shell
+    /// leaks in. (A behavioral end-to-end variant would require mutating
+    /// this process's own environment, which races parallel test threads.)
+    #[test]
+    fn hardened_command_strips_redirection_vars() {
+        let root = std::path::Path::new(".");
+        let invocation = GitInvocation {
+            root,
+            args: &["status", "--short"],
+            cap: 1024,
+            ok_exit_codes: &[0],
+        };
+        let cmd = base_command(&invocation);
+
+        let removed: Vec<String> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_EXTERNAL_DIFF",
+        ] {
+            assert!(
+                removed.iter().any(|k| k == var),
+                "hardened command must strip {var}; removals = {removed:?}"
+            );
+        }
+
+        let pinned: Vec<(String, String)> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        for (key, expected) in [("GIT_OPTIONAL_LOCKS", "1"), ("GIT_TERMINAL_PROMPT", "0")] {
+            assert_eq!(
+                pinned
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.as_str()),
+                Some(expected),
+                "{key} must be pinned for non-interactive hardened runs"
+            );
+        }
+        assert!(
+            pinned.iter().any(|(k, v)| k == "PAGER" && v == "cat"),
+            "pagers must be disabled via environment too"
+        );
+    }
+}
