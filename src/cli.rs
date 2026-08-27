@@ -34,7 +34,7 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = TransportChoice::Stdio)]
     pub transport: TransportChoice,
 
-    /// HTTP bind host (loopback by default; binding a public address is explicit opt-in)
+    /// HTTP bind host (loopback only: 127.0.0.1, ::1, or localhost)
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
 
