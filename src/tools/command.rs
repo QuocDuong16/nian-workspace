@@ -12,11 +12,11 @@
 
 use crate::config::AppState;
 use crate::error::{ToolError, ToolResult};
+use crate::process::ProcessTreeGuard;
 use crate::tools::{decode_lossy, read_capped};
 use rmcp::schemars;
 use serde_json::json;
 use std::process::Stdio;
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -141,13 +141,16 @@ pub(crate) async fn handle(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd.env("PWD", cwd.to_string_lossy().into_owned());
+    // Contain the whole tree before spawn: own process group on Unix,
+    // Job Object attachment right after spawn on Windows.
+    crate::process::configure(&mut cmd);
     tracing::info!(cwd = %ws.display_relative(&cwd), "run_command starting");
 
     let mut child = cmd
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| ToolError::msg(format!("Failed to start command: {e}")))?;
-
+    let tree = ProcessTreeGuard::attach(child.id());
     let started = std::time::Instant::now();
     let deadline = tokio::time::Duration::from_secs(timeout_secs);
 
@@ -159,18 +162,16 @@ pub(crate) async fn handle(
     let read_stdout = async {
         let capped = read_capped(&mut stdout_pipe, stdout_cap).await?;
         // Continue draining until EOF so the child never blocks on a full
-        // pipe, while discarding overflow data beyond the cap.
+        // pipe; overflow beyond the cap is discarded in fixed-size chunks.
         if capped.truncated {
-            let mut sink = Vec::new();
-            let _ = stdout_pipe.read_to_end(&mut sink).await;
+            drain_discard(&mut stdout_pipe).await;
         }
         Ok::<_, std::io::Error>(capped)
     };
     let read_stderr = async {
         let capped = read_capped(&mut stderr_pipe, stderr_cap).await?;
         if capped.truncated {
-            let mut sink = Vec::new();
-            let _ = stderr_pipe.read_to_end(&mut sink).await;
+            drain_discard(&mut stderr_pipe).await;
         }
         Ok::<_, std::io::Error>(capped)
     };
@@ -204,12 +205,24 @@ pub(crate) async fn handle(
         }
         Ok(Err(e)) => Err(ToolError::msg(format!("Command I/O failed: {e}"))),
         Err(_elapsed) => {
-            // Timeout: kill the whole process group where supported, else the child.
-            kill_process_tree(&mut child).await;
-            let remaining_out = drain_output(&mut stdout_pipe, stdout_cap).await;
-            let remaining_err = drain_output(&mut stderr_pipe, stderr_cap).await;
-            let (stdout_text, _) = decode_lossy(&remaining_out);
-            let (stderr_text, _) = decode_lossy(&remaining_err);
+            // Timeout: terminate the whole process tree (process group on
+            // Unix, Job Object on Windows), then collect whatever output the
+            // pipes still held before termination took effect.
+            tree.terminate_tree(&mut child).await;
+            let remaining_out = read_capped(&mut stdout_pipe, stdout_cap)
+                .await
+                .unwrap_or_else(|_| crate::tools::CappedBytes {
+                    bytes: Vec::new(),
+                    truncated: false,
+                });
+            let remaining_err = read_capped(&mut stderr_pipe, stderr_cap)
+                .await
+                .unwrap_or_else(|_| crate::tools::CappedBytes {
+                    bytes: Vec::new(),
+                    truncated: false,
+                });
+            let (stdout_text, _) = decode_lossy(&remaining_out.bytes);
+            let (stderr_text, _) = decode_lossy(&remaining_err.bytes);
             tracing::warn!(timeout_secs, "command timed out and was terminated");
             Ok(json!({
                 "exit_code": null,
@@ -233,9 +246,9 @@ fn exit_code_of(status: &std::process::ExitStatus) -> i64 {
 }
 
 fn signal_of(status: &std::process::ExitStatus) -> Option<String> {
-    use std::os::unix::process::ExitStatusExt;
     #[cfg(unix)]
     {
+        use std::os::unix::process::ExitStatusExt;
         status.signal().map(|s| format!("SIG{s}"))
     }
     #[cfg(not(unix))]
@@ -262,17 +275,18 @@ fn shell_command(command_line: &str) -> Command {
     }
 }
 
-async fn kill_process_tree(child: &mut tokio::process::Child) {
-    // Best effort: plain kill covers virtually all cases since we spawn
-    // without a new session in v0.1; idempotent drop-kill also runs later.
-    let _ = child.start_kill();
-}
-
-async fn drain_output(pipe: &mut (impl tokio::io::AsyncRead + Unpin), cap: usize) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(cap.min(16 * 1024));
-    let _ = pipe.read_to_end(&mut buf).await;
-    buf.truncate(cap);
-    buf
+/// Discard everything left on a pipe in fixed-size chunks — never collects
+/// unbounded output into memory. Errors are ignored: this runs when the
+/// process is being torn down anyway.
+async fn drain_discard(pipe: &mut (impl tokio::io::AsyncRead + Unpin)) {
+    use tokio::io::AsyncReadExt;
+    let mut sink = [0u8; 16 * 1024];
+    loop {
+        match pipe.read(&mut sink).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -361,6 +375,82 @@ mod tests {
         assert!(out["message"].as_str().unwrap().contains("timeout"));
         // Returned promptly rather than after the full 30s sleep.
         assert!((out["duration_ms"].as_u64().unwrap()) < 10_000);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_terminates_descendants_of_the_child() {
+        // The shell spawns a grandchild; both must be gone after the timeout
+        // fires. The grandchild writes a marker only if it is still alive
+        // five seconds after being orphaned, which would fail this test.
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join("survived");
+        let ws = Workspace::open(tmp.path()).unwrap();
+        let state = AppState::new(
+            ws,
+            Permissions::from_flags(true, true, false).unwrap(),
+            Limits::default(),
+        );
+        let script = format!(
+            "sh -c 'sleep 5 && touch {marker}' & sleep 600",
+            marker = marker.display()
+        );
+        let out = run(
+            &state,
+            RunCommandArgs {
+                program: Some("sh".into()),
+                args: Some(vec!["-c".into(), script]),
+                shell: false,
+                command: None,
+                cwd: None,
+                timeout_seconds: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["timed_out"], json!(true));
+
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        assert!(
+            !marker.exists(),
+            "grandchild outlived the timed-out command"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oversized_output_is_discarded_without_unbounded_allocation() {
+        // ~32 MiB of stdout against a tiny cap: must complete without
+        // deadlock and retain at most `cap` bytes.
+        let tmp = TempDir::new().unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        let state = AppState::new(
+            ws,
+            Permissions::from_flags(true, true, false).unwrap(),
+            Limits {
+                max_command_stdout: 256,
+                ..Limits::default()
+            },
+        );
+        let out = run(
+            &state,
+            RunCommandArgs {
+                program: Some("head".into()),
+                args: Some(vec![
+                    "-c".into(),
+                    (32 * 1024 * 1024).to_string(),
+                    "/dev/zero".into(),
+                ]),
+                shell: false,
+                command: None,
+                cwd: None,
+                timeout_seconds: Some(60),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(out["stdout"].as_str().unwrap().len() <= 256);
+        assert_eq!(out["truncated"], json!(true));
     }
 
     #[cfg(unix)]

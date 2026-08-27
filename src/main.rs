@@ -7,6 +7,7 @@ mod cli;
 mod config;
 mod error;
 mod permissions;
+mod process;
 mod server;
 mod tools;
 mod transport;
