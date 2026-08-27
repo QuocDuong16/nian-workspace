@@ -3,8 +3,17 @@
 //! Accepts a unified diff (created with `diff -u`, `git diff`, or produced by
 //! an AI client), validates it against the workspace boundary, and applies it
 //! per file: each file's new content is built fully in memory and only then
-//! written atomically. A failed hunk aborts the whole patch without
-//! corrupting any file.
+//! written. All hunks of all files are validated (against the original
+//! content, in memory) before any disk mutation happens; a failed hunk
+//! aborts the whole patch without touching any file.
+//!
+//! Durability guarantees, stated honestly:
+//! * every hunk is validated before mutation
+//! * each individual file replacement is atomic where the filesystem
+//!   supports rename (sibling temp file + `rename`)
+//! * an unexpected filesystem failure during the final commit phase may
+//!   leave a multi-file patch partially applied — this tool does not provide
+//!   rollback across files
 
 use crate::config::AppState;
 use crate::error::{ToolError, ToolResult};
@@ -16,7 +25,7 @@ use std::path::{Path, PathBuf};
 pub struct ApplyPatchArgs {
     /// Unified diff text (`diff -u` / `git diff` format). Multi-file diffs are applied as one unit: every hunk must apply cleanly or nothing is written.
     #[schemars(
-        description = "Unified diff text in 'diff -u'/'git diff' format. May contain multiple files; all hunks must apply cleanly or nothing is written."
+        description = "Unified diff text in 'diff -u'/'git diff' format. May contain multiple files. All hunks are validated before mutation; each individual file replacement is atomic, but an unexpected filesystem failure during the commit phase can leave a multi-file patch partially applied."
     )]
     pub patch: String,
 }
@@ -131,27 +140,49 @@ pub(crate) fn handle(state: &AppState, args: ApplyPatchArgs) -> ToolResult<serde
         };
 
         let original_text = decode_utf8(&original_bytes, &file.old_path)?;
+        let newline_style = detect_newline_style(&original_text);
         let mut working: Vec<String> = if original_text.is_empty() {
             Vec::new()
         } else {
-            original_text.lines().map(String::from).collect()
+            // Split without \r: lines keep their content; the separator is
+            // re-applied uniformly on join below.
+            split_lines_normalized(&original_text)
         };
-        // A final newline on a non-empty file; "\ No newline at end of file"
-        // markers are tolerated but the common case is preserved.
         let had_trailing_newline = original_text.ends_with('\n');
 
+        let mut applied_offset: i64 = 0;
         for (idx, hunk) in file.hunks.iter().enumerate() {
-            apply_hunk(&mut working, hunk, idx + 1, &file.new_path, file.creation)?;
+            apply_hunk(
+                &mut working,
+                hunk,
+                idx + 1,
+                &file.new_path,
+                file.creation,
+                // Hunks carry original-file line numbers; earlier hunks may
+                // have shifted content, so pass the accumulated delta down.
+                applied_offset,
+            )?;
+            applied_offset = hunk_delta(applied_offset, hunk);
         }
 
-        let mut out = working.join("\n");
+        let line_sep = match newline_style {
+            NewlineStyle::Crlf => "\r\n",
+            NewlineStyle::Lf => "\n",
+        };
+        let mut out = working.join(line_sep);
         if !out.is_empty() && (had_trailing_newline || file.creation) {
-            out.push('\n');
+            out.push_str(if matches!(newline_style, NewlineStyle::Crlf) {
+                "\r\n"
+            } else {
+                "\n"
+            });
         }
         staged.push((rel_display.clone(), resolved.clone(), out.into_bytes()));
     }
 
     // Everything applied cleanly in memory — commit to disk now.
+    // Note: each replacement is individually atomic, but a failure part-way
+    // through this loop leaves earlier files written (documented limitation).
     for (_rel, resolved, bytes) in &staged {
         atomic_write(resolved, bytes)?;
         tracing::info!(target = %resolved.display(), "applied patch");
@@ -169,6 +200,33 @@ fn strip_a_b(p: &str) -> &str {
         .unwrap_or(p)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewlineStyle {
+    Lf,
+    Crlf,
+}
+
+/// Decide which separator re-joins modified lines. The first CRLF wins —
+/// mixed-ending files keep whatever style appears (first), rather than being
+/// normalized to something they never were.
+fn detect_newline_style(text: &str) -> NewlineStyle {
+    let mut bytes = text.as_bytes();
+    while let Some(pos) = bytes.iter().position(|&b| b == b'\n') {
+        if pos > 0 && bytes[pos - 1] == b'\r' {
+            return NewlineStyle::Crlf;
+        }
+        bytes = &bytes[pos + 1..];
+    }
+    NewlineStyle::Lf
+}
+
+/// Split into content lines exactly like `str::lines()` but treat `\r\n` and
+/// `\n` identically (which `.lines()` already does) — kept as a named helper
+/// so the newline-preservation contract has one obvious home.
+fn split_lines_normalized(text: &str) -> Vec<String> {
+    text.lines().map(String::from).collect()
+}
+
 fn decode_utf8(bytes: &[u8], display: &str) -> ToolResult<String> {
     String::from_utf8(bytes.to_vec()).map_err(|_| {
         ToolError::msg(format!(
@@ -177,7 +235,10 @@ fn decode_utf8(bytes: &[u8], display: &str) -> ToolResult<String> {
     })
 }
 
-/// Write via a sibling temp file + rename so readers never observe a torn file.
+/// Replace `target` atomically: write a fresh exclusive sibling temp file,
+/// carry over the old file's permissions where applicable, then rename over
+/// the target. Readers never observe a torn file, and the temp name cannot
+/// collide or be pre-planted (exclusive creation in the same directory).
 fn atomic_write(target: &Path, bytes: &[u8]) -> ToolResult<()> {
     use std::io::Write;
     if let Some(parent) = target.parent() {
@@ -188,30 +249,38 @@ fn atomic_write(target: &Path, bytes: &[u8]) -> ToolResult<()> {
             ))
         })?;
     }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let tmp_name = format!(
-        ".{}.tmp{}",
-        target
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file"),
-        nanos
-    );
-    let tmp_path = target.with_file_name(tmp_name);
-    {
-        let mut f = std::fs::File::create(&tmp_path).map_err(|e| {
+
+    // NamedTempFile keeps the file open with O_EXCL semantics; the prefix
+    // makes any leaked temp identifiable and .gitignore-able.
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".nian-patch-tmp")
+        .tempfile_in(
+            target
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+        )
+        .map_err(|e| {
             ToolError::msg(format!(
-                "Failed to create temp file '{}': {e}",
-                tmp_path.display()
+                "Failed to create temp file next to '{}': {e}",
+                target.display()
             ))
         })?;
-        f.write_all(bytes)
-            .map_err(|e| ToolError::msg(format!("Failed to write temp file: {e}")))?;
+    tmp.write_all(bytes)
+        .map_err(|e| ToolError::msg(format!("Failed to write temp file: {e}")))?;
+    tmp.flush()
+        .map_err(|e| ToolError::msg(format!("Failed to flush temp file: {e}")))?;
+
+    // Preserve existing permission bits so, e.g., an executable script
+    // stays executable after being patched (POSIX platforms only).
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(target) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode));
     }
-    std::fs::rename(&tmp_path, target)
+
+    tmp.persist(target)
         .map_err(|e| ToolError::msg(format!("Failed to replace '{}': {e}", target.display())))?;
     Ok(())
 }
@@ -380,20 +449,30 @@ fn parse_hunk<'a>(
 // Application
 // ---------------------------------------------------------------------------
 
-/// Apply one hunk at its stated position, falling back to a ±100-line scan,
-/// mirroring how AI clients produce slightly stale line numbers.
+/// Net line-count change a hunk introduces (added minus removed).
+fn hunk_delta(current_offset: i64, hunk: &Hunk) -> i64 {
+    let expected_len = hunk.expected().len() as i64;
+    let replacement_len = hunk.replacement().len() as i64;
+    current_offset + replacement_len - expected_len
+}
+
+/// Apply one hunk at its stated position adjusted by the cumulative offset of
+/// all previously applied hunks in the same file (their line numbers refer to
+/// the original file). A small residual drift scan (±10 lines) tolerates
+/// stale headers from AI clients without masking genuine mismatches.
 fn apply_hunk(
     target: &mut Vec<String>,
     hunk: &Hunk,
     index: usize,
     display_name: &str,
     creation: bool,
+    offset: i64,
 ) -> ToolResult<()> {
     let expected = hunk.expected();
 
     if creation || expected.is_empty() {
-        // Pure insertion at/after line old_start.
-        let pos = (hunk.old_start as usize).min(target.len());
+        // Pure insertion at/after line old_start (+ accumulated offset).
+        let pos = ((hunk.old_start as i64) + offset).clamp(0, target.len() as i64) as usize;
         let replacement: Vec<String> = hunk.replacement();
         target.splice(pos..pos, replacement);
         return Ok(());
@@ -411,12 +490,13 @@ fn apply_hunk(
                 .all(|(got, want)| got.as_str() == *want)
     };
 
-    let start = hunk.old_start as i64;
+    // Expected position: stated original line + net change from earlier hunks.
+    let start = (hunk.old_start as i64) + offset;
     let position: i64 = if starts_at(start) {
         start
     } else {
         let limit = target.len() as i64;
-        (1..=100i64)
+        (1..=10i64)
             .flat_map(|d| [start - d, start + d])
             .find(|&c| c >= 1 && c <= limit.max(1) && starts_at(c))
             .ok_or_else(|| {
@@ -661,5 +741,199 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("rename from"));
+    }
+
+    // -- multi-hunk offset correctness (review pass #8) ---------------------
+
+    #[test]
+    fn earlier_insertion_shifts_later_hunk() {
+        let (_t, state) = fixture(BASE);
+        // Hunk 1 inserts 3 lines near the top; hunk 2's header still refers
+        // to the ORIGINAL line numbers ("gamma" was original line 3).
+        let patch = concat!(
+            "--- sample.txt\n+++ sample.txt\n",
+            "@@ -1,2 +1,5 @@\n",
+            "-alpha\n-beta\n+alpha\n+ins1\n+ins2\n+ins3\n+beta\n",
+            "@@ -3,1 +6,1 @@\n",
+            "-gamma\n+GAMMA\n",
+        );
+        handle(
+            &state,
+            ApplyPatchArgs {
+                patch: patch.into(),
+            },
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(_t.path().join("sample.txt")).unwrap();
+        assert_eq!(
+            content,
+            "alpha\nins1\nins2\nins3\nbeta\nGAMMA\ndelta\nepsilon\n"
+        );
+    }
+
+    #[test]
+    fn earlier_deletion_shifts_later_hunk() {
+        let (_t, state) = fixture(BASE);
+        // Hunk 1 deletes two lines; hunk 2 edits a line whose original
+        // position is 4 but which now sits at line 2.
+        let patch = concat!(
+            "--- sample.txt\n+++ sample.txt\n",
+            "@@ -1,2 +1,0 @@\n",
+            "-alpha\n-beta\n",
+            "@@ -4,1 +2,1 @@\n",
+            "-delta\n+DELTA\n",
+        );
+        handle(
+            &state,
+            ApplyPatchArgs {
+                patch: patch.into(),
+            },
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(_t.path().join("sample.txt")).unwrap();
+        assert_eq!(content, "gamma\nDELTA\nepsilon\n");
+    }
+
+    #[test]
+    fn multiple_hunks_on_one_file_apply_sequentially() {
+        let (_t, state) = fixture("l1\nl2\nl3\nl4\nl5\nl6\n");
+        let patch = concat!(
+            "--- sample.txt\n+++ sample.txt\n",
+            "@@ -1,1 +1,1 @@\n-l1\n+L1\n",
+            "@@ -3,1 +3,1 @@\n-l3\n+L3\n",
+            "@@ -6,1 +6,1 @@\n-l6\n+L6\n",
+        );
+        handle(
+            &state,
+            ApplyPatchArgs {
+                patch: patch.into(),
+            },
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(_t.path().join("sample.txt")).unwrap();
+        assert_eq!(content, "L1\nl2\nL3\nl4\nl5\nL6\n");
+    }
+
+    #[test]
+    fn failed_later_hunk_in_second_file_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "A1\nA2\n").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "B1\nB2\n").unwrap();
+        let state = writable_state(tmp.path());
+        let patch = concat!(
+            "--- a.txt\n+++ a.txt\n@@ -1,1 +1,1 @@\n-A1\n+AX1\n",
+            "--- b.txt\n+++ b.txt\n@@ -1,1 +1,1 @@\n-NOT-THE-CONTENT\n+nope\n",
+        );
+        let err = handle(
+            &state,
+            ApplyPatchArgs {
+                patch: patch.into(),
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Failed to apply hunk"));
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+            "A1\nA2\n",
+            "file A must not be written when file B fails validation"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("b.txt")).unwrap(),
+            "B1\nB2\n"
+        );
+    }
+
+    // -- newline-style preservation (review pass #10) ------------------------
+
+    #[test]
+    fn crlf_files_stay_crlf() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("crlf.txt"), "one\r\ntwo\r\n").unwrap();
+        let state = writable_state(tmp.path());
+        let patch = "--- crlf.txt\n+++ crlf.txt\n@@ -1,2 +1,2 @@\n-one\r\n-two\r\n+ONE\r\n+TWO\r\n";
+        handle(
+            &state,
+            ApplyPatchArgs {
+                patch: patch.into(),
+            },
+        )
+        .unwrap();
+        let bytes = std::fs::read(tmp.path().join("crlf.txt")).unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "ONE\r\nTWO\r\n",
+            "CRLF endings must survive the edit"
+        );
+    }
+
+    #[test]
+    fn lf_files_stay_lf() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("lf.txt"), "one\ntwo\n").unwrap();
+        let state = writable_state(tmp.path());
+        let patch = "--- lf.txt\n+++ lf.txt\n@@ -1,2 +1,2 @@\n-one\n-two\n+ONE\n+TWO\n";
+        handle(
+            &state,
+            ApplyPatchArgs {
+                patch: patch.into(),
+            },
+        )
+        .unwrap();
+        let bytes = std::fs::read(tmp.path().join("lf.txt")).unwrap();
+        assert_eq!(bytes, b"ONE\nTWO\n", "LF endings must survive the edit");
+    }
+
+    // -- temp-file safety (review pass #11) ----------------------------------
+
+    #[test]
+    fn no_leftover_temp_files_after_patch() {
+        let (tmp, state) = fixture(BASE);
+        handle(
+            &state,
+            ApplyPatchArgs {
+                patch: simple_diff(""),
+            },
+        )
+        .unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".nian-patch-tmp")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "temp files leaked: {leftovers:?}");
+    }
+
+    // -- permission preservation (review pass #9, Unix-only) -----------------
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_permissions_survive_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let script = tmp.path().join("script.sh");
+        std::fs::write(&script, b"#!/bin/sh\necho one\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let state = writable_state(tmp.path());
+        let patch =
+            "--- script.sh\n+++ script.sh\n@@ -1,2 +1,2 @@\n-#!/bin/sh\n-echo one\n+#!/bin/sh\n+echo two\n";
+        handle(
+            &state,
+            ApplyPatchArgs {
+                patch: patch.into(),
+            },
+        )
+        .unwrap();
+
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "permission bits changed by atomic replacement"
+        );
     }
 }
