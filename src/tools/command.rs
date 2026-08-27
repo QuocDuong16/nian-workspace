@@ -205,33 +205,64 @@ pub(crate) async fn handle(
         }
         Ok(Err(e)) => Err(ToolError::msg(format!("Command I/O failed: {e}"))),
         Err(_elapsed) => {
-            // Timeout: terminate the whole process tree (process group on
-            // Unix, Job Object on Windows), then collect whatever output the
-            // pipes still held before termination took effect.
-            tree.terminate_tree(&mut child).await;
-            let remaining_out = read_capped(&mut stdout_pipe, stdout_cap)
-                .await
-                .unwrap_or_else(|_| crate::tools::CappedBytes {
-                    bytes: Vec::new(),
-                    truncated: false,
-                });
-            let remaining_err = read_capped(&mut stderr_pipe, stderr_cap)
-                .await
-                .unwrap_or_else(|_| crate::tools::CappedBytes {
-                    bytes: Vec::new(),
-                    truncated: false,
-                });
+            // Timeout. The invariant: a command timeout bounds how long this
+            // function can remain stuck afterwards, even if an escaped
+            // descendant keeps the inherited pipes open forever.
+            //
+            // Teardown sequence (all inside a small fixed grace deadline):
+            //   1. terminate the whole process tree
+            //   2. reap the direct child (wait)
+            //   3. drain whatever bounded output the pipes still held
+            // If the grace period expires first, everything below is simply
+            // dropped — dropping the Child also kills it, and dropping the
+            // pipe handles closes them, so cleanup can never hang forever.
+            const POST_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+            let teardown = async {
+                tree.terminate_tree(&mut child).await;
+                // Reap the direct child so it cannot linger as a zombie.
+                let reaped = child.wait().await.is_ok();
+                // Collect what was in flight when the kill landed; read_capped
+                // retains at most its cap and discards the rest chunk-wise.
+                // Pipes are owned here: if the deadline expires mid-drain the
+                // future is dropped and closing them takes care of cleanup.
+                let out = read_capped(&mut stdout_pipe, stdout_cap)
+                    .await
+                    .unwrap_or_else(|_| empty_capped());
+                let err = read_capped(&mut stderr_pipe, stderr_cap)
+                    .await
+                    .unwrap_or_else(|_| empty_capped());
+                (reaped, out, err)
+            };
+
+            let (reaped, remaining_out, remaining_err) =
+                match tokio::time::timeout(POST_KILL_GRACE, teardown).await {
+                    Ok((reaped, out, err)) => (reaped, out, err),
+                    Err(_) => {
+                        tracing::warn!(timeout_secs, "post-kill cleanup exceeded its grace period");
+                        (false, empty_capped(), empty_capped())
+                    }
+                };
+            let cleaned_up = reaped;
+
+            tracing::warn!(
+                timeout_secs,
+                graceful_teardown = cleaned_up,
+                "command timed out and was terminated"
+            );
             let (stdout_text, _) = decode_lossy(&remaining_out.bytes);
             let (stderr_text, _) = decode_lossy(&remaining_err.bytes);
-            tracing::warn!(timeout_secs, "command timed out and was terminated");
             Ok(json!({
                 "exit_code": null,
                 "stdout": stdout_text,
                 "stderr": stderr_text,
                 "truncated": true,
-                "duration_ms": duration_ms,
+                "duration_ms": u128_as_u64(started.elapsed().as_millis()),
                 "timed_out": true,
-                "message": format!("Command exceeded the {timeout_secs} second timeout and was terminated."),
+                "message": format!(
+                    "Command exceeded the {timeout_secs} second timeout and was terminated{}.",
+                    if cleaned_up && reaped { "" } else { "; some post-kill cleanup did not finish within its grace period" }
+                ),
             }))
         }
     }
@@ -272,6 +303,13 @@ fn shell_command(command_line: &str) -> Command {
         let mut c = Command::new("/bin/sh");
         c.arg("-c").arg(command_line);
         c
+    }
+}
+
+fn empty_capped() -> crate::tools::CappedBytes {
+    crate::tools::CappedBytes {
+        bytes: Vec::new(),
+        truncated: false,
     }
 }
 
@@ -414,6 +452,98 @@ mod tests {
         assert!(
             !marker.exists(),
             "grandchild outlived the timed-out command"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_timeout_cleanup_cannot_block_indefinitely() {
+        // A descendant that escapes the process group (setsid) but keeps our
+        // inherited pipes open: it dies on its own after 9 seconds, so an
+        // implementation waiting for pipe EOF would hang ~8 extra seconds.
+        // The bounded grace period must return well before that.
+        let (_t, state) = exec_state();
+        let started = std::time::Instant::now();
+        let out = run(
+            &state,
+            RunCommandArgs {
+                program: Some("sh".into()),
+                args: Some(vec!["-c".into(), "setsid sleep 9 &\nsleep 600".into()]),
+                shell: false,
+                command: None,
+                cwd: None,
+                timeout_seconds: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(out["timed_out"], json!(true));
+        assert_eq!(out["exit_code"], serde_json::Value::Null);
+        assert!(
+            elapsed < std::time::Duration::from_secs(6),
+            "run_command stayed stuck {:?} after its own deadline",
+            elapsed
+        );
+    }
+
+    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timed_out_child_is_reaped_before_returning() {
+        // Behavioral check for wait/reap ordering: once run_command returns
+        // from a timeout, no zombie child of this test process may remain.
+        let (_t, state) = exec_state();
+        let out = run(
+            &state,
+            RunCommandArgs {
+                program: Some("sleep".into()),
+                args: Some(vec!["60".into()]),
+                shell: false,
+                command: None,
+                cwd: None,
+                timeout_seconds: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["timed_out"], json!(true));
+
+        let self_pid = std::process::id().to_string();
+        let children_text = std::fs::read_to_string(format!("/proc/{self_pid}/task"))
+            .ok()
+            .and_then(|_| {
+                // Sum children lists of all threads.
+                let mut acc = String::new();
+                if let Ok(entries) = std::fs::read_dir(format!("/proc/{self_pid}/task")) {
+                    for entry in entries.flatten() {
+                        if let Ok(c) = std::fs::read_to_string(entry.path().join("children")) {
+                            acc.push_str(&c);
+                        }
+                    }
+                }
+                Some(acc)
+            })
+            .unwrap_or_default();
+
+        let zombies: Vec<String> = children_text
+            .split_whitespace()
+            .filter(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .map(|stat| {
+                        stat.rsplit(')')
+                            .next()
+                            .unwrap_or("")
+                            .trim_start()
+                            .starts_with('Z')
+                    })
+                    .unwrap_or(false)
+            })
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            zombies.is_empty(),
+            "zombie children left behind after timeout teardown: {zombies:?}"
         );
     }
 
