@@ -455,6 +455,41 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn oversized_stderr_is_bounded_without_deadlock() {
+        // ~32 MiB on stderr against a tiny stderr cap; stdout stays empty.
+        let tmp = TempDir::new().unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        let state = AppState::new(
+            ws,
+            Permissions::from_flags(true, true, false).unwrap(),
+            Limits {
+                max_command_stderr: 256,
+                ..Limits::default()
+            },
+        );
+        let out = run(
+            &state,
+            RunCommandArgs {
+                program: Some("sh".into()),
+                args: Some(vec![
+                    "-c".into(),
+                    "dd if=/dev/zero bs=1M count=32 1>&2 2>/dev/null".into(),
+                ]),
+                shell: false,
+                command: None,
+                cwd: None,
+                timeout_seconds: Some(60),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["exit_code"], json!(0));
+        assert!(out["stderr"].as_str().unwrap().len() <= 256);
+        assert_eq!(out["truncated"], json!(true));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn output_truncation_is_reported() {
         let tmp = TempDir::new().unwrap();
         let ws = Workspace::open(tmp.path()).unwrap();

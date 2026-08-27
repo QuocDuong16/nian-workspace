@@ -239,8 +239,10 @@ pub(crate) fn read_file(state: &AppState, args: ReadFileArgs) -> ToolResult<serd
     loop {
         let mut raw_buf: Vec<u8> = Vec::with_capacity(512);
         // Bounded line read: a pathological no-newline file cannot drive
-        // allocation past max_source_line_bytes per line.
-        let (n, oversized) = read_line_bounded(
+        // allocation past max_source_line_bytes per line. Excess bytes for
+        // an oversized line are consumed and dropped inside the reader; the
+        // clipped rendering path below flags the truncation.
+        let (n, _oversized) = read_line_bounded(
             &mut reader,
             b'\n',
             &mut raw_buf,
