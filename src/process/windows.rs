@@ -1,6 +1,6 @@
 //! Windows implementation: each spawned child is attached to its own Job
 //! Object with kill-on-close semantics, so terminating the job ends the whole
-//! descendant tree and dropping the guard does too.
+//! descendant tree and closing the guard's handle does too.
 
 use tokio::process::Command;
 use windows_sys::Win32::{
@@ -19,9 +19,11 @@ pub(crate) fn configure(_cmd: &mut Command) {}
 
 /// Create a kill-on-close Job Object containing the given process.
 ///
-/// Returns the job handle (ownership moves to the caller-guard); `None` means
-/// containment could not be established and the caller degrades gracefully.
-pub(crate) fn attach_to_job_object(pid: u32) -> Option<HANDLE> {
+/// Returns the job handle as an integer: raw `HANDLE` values are not `Send`,
+/// but kernel handles are thread-safe opaque ids, and the integer form lets
+/// the guard move across the async runtime. `None` means containment could
+/// not be established and the caller degrades gracefully.
+pub(crate) fn attach_to_job_object(pid: u32) -> Option<isize> {
     unsafe {
         let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
         if job.is_null() {
@@ -45,7 +47,7 @@ pub(crate) fn attach_to_job_object(pid: u32) -> Option<HANDLE> {
                 "SetInformationJobObject failed: {}",
                 std::io::Error::last_os_error()
             );
-            close_quietly(job);
+            close_raw(job);
             return None;
         }
 
@@ -55,7 +57,7 @@ pub(crate) fn attach_to_job_object(pid: u32) -> Option<HANDLE> {
                 "OpenProcess({pid}) failed: {}",
                 std::io::Error::last_os_error()
             );
-            close_quietly(job);
+            close_raw(job);
             return None;
         }
 
@@ -64,17 +66,18 @@ pub(crate) fn attach_to_job_object(pid: u32) -> Option<HANDLE> {
                 "AssignProcessToJobObject failed: {}",
                 std::io::Error::last_os_error()
             );
-            close_quietly(proc);
-            close_quietly(job);
+            close_raw(proc);
+            close_raw(job);
             return None;
         }
-        close_quietly(proc);
-        Some(job)
+        close_raw(proc);
+        Some(job as isize)
     }
 }
 
 /// Terminate every process currently inside the job.
-pub(crate) fn terminate_job(job: HANDLE) {
+pub(crate) fn terminate_job(job_id: isize) {
+    let job = job_id as HANDLE;
     unsafe {
         if TerminateJobObject(job, 1) == 0 {
             tracing::debug!(
@@ -85,7 +88,13 @@ pub(crate) fn terminate_job(job: HANDLE) {
     }
 }
 
-/// Release a job or process handle, ignoring secondary failures.
-pub(crate) fn close_quietly(handle: HANDLE) {
+/// Release a job handle; per kill-on-close this ends any processes still in
+/// it. Ignoring secondary failures here is fine — the handle is going away.
+pub(crate) fn close_job_handle(job_id: isize) {
+    close_raw(job_id as HANDLE);
+}
+
+/// Close any Win32 handle, ignoring secondary failures.
+fn close_raw(handle: HANDLE) {
     unsafe { CloseHandle(handle) };
 }

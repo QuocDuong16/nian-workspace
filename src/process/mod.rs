@@ -8,7 +8,8 @@
 //!   leader alone.
 //! * **Windows** — the child is attached to a fresh Job Object with
 //!   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; terminating the job ends every
-//!   descendant still inside it, and closing the guard does the same.
+//!   descendant still inside it, and dropping the guard (closing the last
+//!   job handle) does the same.
 //!
 //! Both mechanisms are best-effort containment, not a sandbox: a grandchild
 //! spawned in the microseconds between `spawn()` and job attachment escapes,
@@ -26,11 +27,18 @@ pub(crate) use unix::configure as configure_impl;
 #[cfg(windows)]
 pub(crate) use windows::configure as configure_impl;
 
-/// A held resource that lets [`terminate`] reach the whole process tree.
+/// A held resource that lets [`ProcessTreeGuard::terminate_tree`] reach the
+/// whole process tree.
 ///
-/// Construct immediately after a successful [`spawn`](tokio::process::Command::spawn);
-/// dropping the guard releases the underlying job handle (which on Windows
-/// also kills any processes still attached via kill-on-close).
+/// Construct immediately after a successful
+/// [`spawn`](tokio::process::Command::spawn). Dropping the guard releases the
+/// underlying job handle (which on Windows also kills any processes still
+/// attached via kill-on-close — even after a normal exit of the direct
+/// child, stray descendants do not survive their job being closed).
+///
+/// The Windows variant stores the raw handle as an integer so the guard
+/// stays `Send + Sync`: tokio tool futures must remain sendable across the
+/// async runtime, and kernel handles are thread-safe opaque values.
 pub(crate) struct ProcessTreeGuard {
     inner: GuardInner,
 }
@@ -39,9 +47,7 @@ enum GuardInner {
     #[cfg(unix)]
     Unix { pgid: u32 },
     #[cfg(windows)]
-    Windows {
-        job: windows_sys::Win32::Foundation::HANDLE,
-    },
+    Windows { job: isize },
     #[cfg(not(any(unix, windows)))]
     Unsupported,
 }
@@ -51,9 +57,9 @@ impl ProcessTreeGuard {
     /// failed attachment degrades to no-op termination with a warning.
     ///
     /// `child_pid` is the direct child's pid; on Windows it must be an
-    /// already-running process id, hence taking the value rather than the
-    /// still-spawning handle. `None` ids (possible on exotic platforms) skip
-    /// tree attachment but `terminate_tree` still kills the child directly.
+    /// already-running process id. `None` ids (possible on exotic platforms)
+    /// skip tree attachment but [`terminate_tree`](Self::terminate_tree)
+    /// still kills the direct child.
     pub(crate) fn attach(child_pid: Option<u32>) -> Self {
         #[cfg(unix)]
         {
@@ -84,9 +90,7 @@ impl ProcessTreeGuard {
                          timeout termination will cover only the direct child"
                     );
                     Self {
-                        inner: GuardInner::Windows {
-                            job: std::ptr::null_mut(),
-                        },
+                        inner: GuardInner::Windows { job: 0 },
                     }
                 }
             }
@@ -102,23 +106,29 @@ impl ProcessTreeGuard {
 
     /// Terminate the entire process tree (best effort).
     ///
-    /// `finish_child` must eventually reap the direct child afterwards so it
-    /// does not linger as a zombie.
+    /// The caller must await/reap the direct child afterwards so it does not
+    /// linger as a zombie or unobserved exit status.
     pub(crate) async fn terminate_tree(&self, finish_child: &mut tokio::process::Child) {
         match &self.inner {
             #[cfg(unix)]
             GuardInner::Unix { pgid } if *pgid != 0 => unix::kill_process_group(*pgid),
             #[cfg(windows)]
-            GuardInner::Windows { job } => {
-                if !job.is_null() {
-                    windows::terminate_job(*job);
-                }
-            }
+            GuardInner::Windows { job } if *job != 0 => windows::terminate_job(*job),
             _ => {}
         }
         // Whether the signal/job reached the child or not, make sure the
-        // direct child is dead and reaped on both platforms.
+        // direct child is dead on both platforms before it is reaped.
         let _ = finish_child.start_kill();
+    }
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        match &self.inner {
+            GuardInner::Windows { job } if *job != 0 => windows::close_job_handle(*job),
+            _ => {}
+        }
     }
 }
 
@@ -152,5 +162,11 @@ mod tests {
             std::os::unix::process::ExitStatusExt::core_dumped(&status) || status.code().is_none(),
             "expected signal termination, got {status:?}"
         );
+    }
+
+    #[test]
+    fn guard_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ProcessTreeGuard>();
     }
 }
