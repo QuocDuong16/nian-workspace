@@ -58,7 +58,8 @@ pub(crate) struct GitOutput {
     /// (independent of stderr; a successful tool's public `truncated`
     /// reflects only this).
     pub stdout_truncated: bool,
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Tracked independently; never merged into the successful response's
+    /// public flag, but surfaced via debug logging so the knowledge exists.
     pub stderr_truncated: bool,
 }
 
@@ -139,11 +140,15 @@ pub(crate) fn run_git_bounded(invocation: &GitInvocation<'_>) -> ToolResult<GitO
     }
 
     let (stdout, _) = crate::tools::decode_lossy(&stdout_capped.bytes);
-    Ok(GitOutput {
+    let out = GitOutput {
         stdout,
         stdout_truncated: stdout_capped.truncated,
         stderr_truncated: stderr_capped.truncated,
-    })
+    };
+    if out.stderr_truncated {
+        tracing::debug!("git stderr exceeded its retention cap (exit code {exit_code})");
+    }
+    Ok(out)
 }
 
 /// Cheap work-tree membership check using the same hardened rules.

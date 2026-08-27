@@ -70,7 +70,7 @@ fn entry_admissible(
         return false; // even under an explicitly requested subtree
     }
     if !name.starts_with('.') {
-        if entry.file_type().is_dir() && is_generated_dir(&name.as_ref()) {
+        if entry.file_type().is_dir() && is_generated_dir(name.as_ref()) {
             return explicit_root;
         }
         return true;

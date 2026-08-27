@@ -510,21 +510,15 @@ mod tests {
         assert_eq!(out["timed_out"], json!(true));
 
         let self_pid = std::process::id().to_string();
-        let children_text = std::fs::read_to_string(format!("/proc/{self_pid}/task"))
-            .ok()
-            .and_then(|_| {
-                // Sum children lists of all threads.
-                let mut acc = String::new();
-                if let Ok(entries) = std::fs::read_dir(format!("/proc/{self_pid}/task")) {
-                    for entry in entries.flatten() {
-                        if let Ok(c) = std::fs::read_to_string(entry.path().join("children")) {
-                            acc.push_str(&c);
-                        }
-                    }
+        // Sum the per-thread children lists of this test process.
+        let mut children_text = String::new();
+        if let Ok(entries) = std::fs::read_dir(format!("/proc/{self_pid}/task")) {
+            for entry in entries.flatten() {
+                if let Ok(c) = std::fs::read_to_string(entry.path().join("children")) {
+                    children_text.push_str(&c);
                 }
-                Some(acc)
-            })
-            .unwrap_or_default();
+            }
+        }
 
         let zombies: Vec<String> = children_text
             .split_whitespace()
