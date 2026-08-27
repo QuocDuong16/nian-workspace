@@ -1,0 +1,68 @@
+name: Quality
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test, build)
+    runs-on: docker
+    timeout-minutes: 60
+    container:
+      image: rust:1.98.0-bookworm
+
+    steps:
+      # The runner container ships without Node.js, which node-based actions
+      # (checkout included) require. Install a pinned runtime first — same
+      # pattern as nian-vision.
+      - name: Install Node.js runtime for actions
+        run: |
+          set -Eeuo pipefail
+          node_version="26.7.0"
+          case "$(uname -m)" in
+            x86_64)
+              node_arch="x64"
+              node_checksum="982aa24dd8be4c889c6a8ab337ddff3b0896645b20f4239356e80552c16277ee"
+              ;;
+            aarch64)
+              node_arch="arm64"
+              node_checksum="afc7a004018485092ac8985b817b0d5684472bd9472e0b57d2ab88737e50090d"
+              ;;
+            *)
+              echo "Unsupported runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          node_archive="node-v${node_version}-linux-${node_arch}.tar.xz"
+          curl --fail --silent --show-error --location \
+            --output "/tmp/${node_archive}" \
+            "https://nodejs.org/dist/v${node_version}/${node_archive}"
+          echo "${node_checksum}  /tmp/${node_archive}" | sha256sum --check -
+          tar --extract --xz --file "/tmp/${node_archive}" \
+            --directory /usr/local --strip-components=1
+
+      - name: Check out repository
+        uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # The official Rust image is based on buildpack-deps and already ships
+      # gcc, make, and pkg-config; nian-workspace has no system-library
+      # dependencies (no TLS), so no apt packages are required.
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo build --release
+        run: cargo build --release

@@ -1,0 +1,55 @@
+[package]
+name = "nian-workspace"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98"
+description = "A minimal, secure local MCP workspace server for AI coding clients."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/QuocDuong16/nian-workspace"
+keywords = ["mcp", "workspace", "coding-agent", "llm", "tools"]
+categories = ["development-tools"]
+
+[[bin]]
+name = "nian-workspace"
+path = "src/main.rs"
+
+[dependencies]
+rmcp = { version = "3.1.4", features = [
+    "server",
+    "macros",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "io-util",
+    "time",
+    "signal",
+    "sync",
+] }
+tokio-util = "0.7"
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Filesystem traversal / search
+walkdir = "2"
+regex = "1"
+globset = "0.4"
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
