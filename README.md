@@ -10,19 +10,32 @@ A minimal, secure local MCP workspace server for AI coding clients.
 
 `nian-workspace` exposes one local directory (the *workspace*) to MCP clients so they can inspect files, search code, edit files, run controlled commands, and inspect Git state — always inside the configured root.
 
+Each running `nian-workspace` process serves exactly one workspace root. Start another process (or switch the process/tunnel profile) when you want to expose a different project.
+
 ```bash
 nian-workspace .
 ```
 
 ## Install
 
-Requires Rust stable.
+Requires Rust 1.98 or newer.
+
+### Build or install from source
 
 ```bash
-cargo install --path .
-# or build only:
-cargo build --release   # binary at target/release/nian-workspace
+git clone https://github.com/QuocDuong16/nian-workspace.git
+cd nian-workspace
+
+# Install into Cargo's binary directory (normally ~/.cargo/bin).
+cargo install --path . --locked
+
+# Or build an optimized binary without installing it.
+cargo build --release --locked
+# Linux/macOS: target/release/nian-workspace
+# Windows:     target/release/nian-workspace.exe
 ```
+
+Tagged releases also publish checksummed archives for the platforms the current Forgejo runner can genuinely link. See [Platform support and CI honesty](#platform-support-and-ci-honesty) for the distinction between native, cross-compiled, and compile-only targets.
 
 ## Usage
 
@@ -66,9 +79,11 @@ nian-workspace . --write --exec --allow-shell  # + shell syntax (cmd.exe / /bin/
 
 ## Client setup
 
+One process owns one workspace root. This is deliberate: the workspace boundary is fixed when the process starts instead of being switched by an MCP request.
+
 ### stdio (recommended for local clients)
 
-Point your client's MCP config at the binary:
+Point your client's MCP config at the installed binary and choose the project root in `args`:
 
 ```json
 {
@@ -81,9 +96,35 @@ Point your client's MCP config at the binary:
 }
 ```
 
+Use an absolute binary path if the client does not inherit your shell `PATH`. Add `--allow-shell` only when the client genuinely needs shell syntax; `--exec` alone is safer for ordinary process execution.
+
 Logs go to stderr; the protocol runs on stdout, so stderr redirection in a wrapper script will not corrupt the session.
 
+### ChatGPT + Secure MCP Tunnel
+
+ChatGPT connects to remote MCP servers rather than directly spawning a local stdio process. Secure MCP Tunnel can bridge a local `nian-workspace` stdio command to ChatGPT without exposing an unauthenticated HTTP listener to the public internet.
+
+After installing and authenticating the Secure MCP Tunnel client, create a profile that starts `nian-workspace` for one project:
+
+```bash
+export CONTROL_PLANE_TUNNEL_ID='your-tunnel-id'
+
+tunnel-client init \
+  --sample sample_mcp_stdio_local \
+  --profile nian-workspace-my-project \
+  --tunnel-id "$CONTROL_PLANE_TUNNEL_ID" \
+  --mcp-command "/absolute/path/to/nian-workspace /absolute/path/to/my-project --write --exec"
+
+tunnel-client run --profile nian-workspace-my-project
+```
+
+Use the MCP endpoint produced by Secure MCP Tunnel when creating the custom MCP app/connector in ChatGPT, then scan the server tools. ChatGPT's exact developer-mode availability and write-action controls depend on the plan and workspace policy, so follow the current ChatGPT UI for enabling the custom app.
+
+The same tunnel can be reused for several local projects by creating several profiles with the same tunnel ID and a different `--mcp-command` workspace path. Only **one backend should actively own a given tunnel at a time**. Stop the currently running profile before starting another profile that reuses the same tunnel. A profile switch changes which `nian-workspace` process is reachable; it does not make one process serve multiple roots.
+
 ### Streamable HTTP
+
+For clients that can reach the machine directly through a trusted local/private path, run the built-in loopback-only Streamable HTTP transport:
 
 ```bash
 nian-workspace . --write --exec --transport http --host 127.0.0.1 --port 8787
@@ -95,7 +136,7 @@ The MCP endpoint is then served at:
 http://127.0.0.1:8787/mcp
 ```
 
-Remote clients such as ChatGPT Web may require a separate secure tunnel or an MCP connector depending on the client. `nian-workspace` does not bundle, manage, or authenticate tunnels — put your own TLS/auth layer in front if you expose the endpoint beyond localhost.
+`nian-workspace` deliberately refuses non-loopback HTTP binds and does not implement public-network authentication. For remote access, put a secure tunnel or another authenticated TLS layer in front of `127.0.0.1`; do not punch a public port through to it.
 
 ## Security
 
@@ -114,19 +155,28 @@ No security guarantees beyond these mechanisms are made. Do not overstate them i
 ## Development
 
 ```bash
-cargo fmt --check
+cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo build --release
 ```
 
-CI runs the same gates on Forgejo (see `.forgejo/workflows/quality.yml`), pinned to Rust 1.98.0 in a Linux container — matching `rust-toolchain.toml`, so local builds and CI use the same toolchain.
+CI runs the same gates on Forgejo (see `.forgejo/workflows/quality.yml`), pinned to Rust 1.98.0 in a Linux container — matching `rust-toolchain.toml`, so local builds and CI use the same toolchain. `.forgejo/workflows/release.yml` handles release packaging when a `v*` tag is pushed.
 
 ### Platform support and CI honesty
 
-CI performs full native validation (fmt, clippy, tests, release build) on Linux.
+The current Forgejo runner is an x86_64 Linux Docker runner. Release coverage is intentionally split by what the runner can actually do:
 
-Windows, macOS (x64 and ARM64), and Linux ARM64 targets receive compile-time cross-target `cargo check` validation from the same Linux Forgejo/DinD runner. Native Windows/macOS runtime testing is not currently available because the project does not have native runners for those operating systems — the foreign binaries are never executed in CI.
+| Platform | CI validation | Release artifact | Notes |
+|---|---|---|---|
+| Linux x86_64 (`x86_64-unknown-linux-gnu`) | Native tests + native release build + binary smoke test | Yes | Runtime-tested on the runner OS/architecture. |
+| Linux arm64 (`aarch64-unknown-linux-gnu`) | Cross-target `cargo check` + cross-linked release build | Yes | Linked with the Debian AArch64 GNU cross-toolchain; not executed in CI. |
+| Windows x86_64 GNU (`x86_64-pc-windows-gnu`) | Cross-linked release build | Yes | Produces a real PE executable with MinGW-w64; not executed in CI. |
+| Windows x86_64 MSVC (`x86_64-pc-windows-msvc`) | Cross-target `cargo check` only | No | A Linux Docker runner does not provide the native MSVC linker/runtime. |
+| macOS x86_64 (`x86_64-apple-darwin`) | Cross-target `cargo check` only | No | Linking requires an Apple SDK/toolchain or a native macOS runner. |
+| macOS arm64 (`aarch64-apple-darwin`) | Cross-target `cargo check` only | No | Linking requires an Apple SDK/toolchain or a native macOS runner. |
+
+The release workflow publishes `nian-workspace-vX.Y.Z-<target>` archives plus a `SHA256SUMS` file. The existing quality workflow continues to compile-check Windows MSVC, both macOS targets, and Linux ARM64 exactly as compile-only targets. Native Windows/macOS release binaries should be added only after corresponding native runners (or a properly licensed SDK/toolchain) exist.
 
 ## License
 

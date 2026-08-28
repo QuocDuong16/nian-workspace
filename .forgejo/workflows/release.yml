@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and publish release artifacts
+    runs-on: docker
+    timeout-minutes: 90
+    container:
+      image: rust:1.98.0-bookworm
+
+    steps:
+      - name: Install Node.js runtime for actions
+        run: |
+          set -Eeuo pipefail
+          node_version="26.7.0"
+          case "$(uname -m)" in
+            x86_64)
+              node_arch="x64"
+              node_checksum="982aa24dd8be4c889c6a8ab337ddff3b0896645b20f4239356e80552c16277ee"
+              ;;
+            aarch64)
+              node_arch="arm64"
+              node_checksum="afc7a004018485092ac8985b817b0d5684472bd9472e0b57d2ab88737e50090d"
+              ;;
+            *) exit 1 ;;
+          esac
+          node_archive="node-v${node_version}-linux-${node_arch}.tar.xz"
+          curl --fail --silent --show-error --location --output "/tmp/${node_archive}" "https://nodejs.org/dist/v${node_version}/${node_archive}"
+          echo "${node_checksum}  /tmp/${node_archive}" | sha256sum --check -
+          tar --extract --xz --file "/tmp/${node_archive}" --directory /usr/local --strip-components=1
+
+      - name: Check out repository
+        uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Verify release tag matches Cargo version
+        run: |
+          set -Eeuo pipefail
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          tag="${FORGEJO_REF_NAME:-${GITHUB_REF_NAME:-}}"
+          if [ -z "$tag" ]; then
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          test "$tag" = "v${cargo_version}" || {
+            echo "Tag ${tag} does not match Cargo.toml version ${cargo_version}" >&2
+            exit 1
+          }
+
+      - name: Install cross-linkers and packaging tools
+        run: |
+          set -Eeuo pipefail
+          apt-get update
+          apt-get install --yes --no-install-recommends file gcc-aarch64-linux-gnu gcc-mingw-w64-x86-64 zip
+          rm -rf /var/lib/apt/lists/*
+          rustup target add aarch64-unknown-linux-gnu x86_64-pc-windows-gnu
+
+      - name: Validate native Linux release
+        run: |
+          set -Eeuo pipefail
+          cargo test --locked
+          cargo build --release --locked
+          ./target/release/nian-workspace --help >/dev/null
+          file target/release/nian-workspace
+
+      - name: Build Linux arm64 release
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          set -Eeuo pipefail
+          cargo build --release --locked --target aarch64-unknown-linux-gnu
+          file target/aarch64-unknown-linux-gnu/release/nian-workspace
+
+      - name: Build Windows x86_64 GNU release
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+        run: |
+          set -Eeuo pipefail
+          cargo build --release --locked --target x86_64-pc-windows-gnu
+          file target/x86_64-pc-windows-gnu/release/nian-workspace.exe
+
+      - name: Package release archives and checksums
+        run: |
+          set -Eeuo pipefail
+          tag="${FORGEJO_REF_NAME:-${GITHUB_REF_NAME:-}}"
+          if [ -z "$tag" ]; then
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          version="${tag#v}"
+          release_dir="$PWD/dist/release"
+          stage_dir="$PWD/dist/stage"
+          mkdir -p "$release_dir" "$stage_dir"
+
+          package_tar() {
+            target="$1"; binary="$2"; name="nian-workspace-v${version}-${target}"
+            mkdir -p "$stage_dir/$name"
+            cp "$binary" README.md LICENSE "$stage_dir/$name/"
+            tar -C "$stage_dir" -czf "$release_dir/${name}.tar.gz" "$name"
+          }
+          package_zip() {
+            target="$1"; binary="$2"; name="nian-workspace-v${version}-${target}"
+            mkdir -p "$stage_dir/$name"
+            cp "$binary" README.md LICENSE "$stage_dir/$name/"
+            (cd "$stage_dir" && zip -qr "$release_dir/${name}.zip" "$name")
+          }
+
+          package_tar x86_64-unknown-linux-gnu target/release/nian-workspace
+          package_tar aarch64-unknown-linux-gnu target/aarch64-unknown-linux-gnu/release/nian-workspace
+          package_zip x86_64-pc-windows-gnu target/x86_64-pc-windows-gnu/release/nian-workspace.exe
+
+          (cd "$release_dir" && sha256sum ./*.tar.gz ./*.zip > SHA256SUMS && sha256sum --check SHA256SUMS)
+
+      - name: Publish Forgejo release
+        uses: https://data.forgejo.org/actions/forgejo-release@v2.13.4
+        with:
+          direction: upload
+          release-dir: dist/release
+          release-notes-file: RELEASE_NOTES.md
