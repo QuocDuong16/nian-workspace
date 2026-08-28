@@ -104,10 +104,13 @@ Logs go to stderr; the protocol runs on stdout, so stderr redirection in a wrapp
 
 ChatGPT connects to remote MCP servers rather than directly spawning a local stdio process. Secure MCP Tunnel can bridge a local `nian-workspace` stdio command to ChatGPT without exposing an unauthenticated HTTP listener to the public internet.
 
-After installing and authenticating the Secure MCP Tunnel client, create a profile that starts `nian-workspace` for one project:
+Create or reuse a Secure MCP Tunnel, then create a **Restricted Runtime API Key** for `tunnel-client` with only **Tunnels: Read** and **Tunnels: Use**. Do not use an Admin API key for the daemon.
+
+Export the runtime API key and tunnel ID before configuring the local profile:
 
 ```bash
-export CONTROL_PLANE_TUNNEL_ID='your-tunnel-id'
+export CONTROL_PLANE_API_KEY='sk-...'
+export CONTROL_PLANE_TUNNEL_ID='tunnel_...'
 
 tunnel-client init \
   --sample sample_mcp_stdio_local \
@@ -115,10 +118,25 @@ tunnel-client init \
   --tunnel-id "$CONTROL_PLANE_TUNNEL_ID" \
   --mcp-command "/absolute/path/to/nian-workspace /absolute/path/to/my-project --write --exec"
 
-tunnel-client run --profile nian-workspace-my-project
+tunnel-client doctor \
+  --profile nian-workspace-my-project \
+  --explain
+
+tunnel-client run \
+  --profile nian-workspace-my-project
 ```
 
-Use the MCP endpoint produced by Secure MCP Tunnel when creating the custom MCP app/connector in ChatGPT, then scan the server tools. ChatGPT's exact developer-mode availability and write-action controls depend on the plan and workspace policy, so follow the current ChatGPT UI for enabling the custom app.
+`CONTROL_PLANE_API_KEY` authenticates `tunnel-client` to the OpenAI tunnel control plane. It is **not** MCP authentication for `nian-workspace` itself; `nian-workspace` does not implement OAuth or bearer-token MCP authentication.
+
+In ChatGPT, configure the custom MCP app/connector using the tunnel directly:
+
+```text
+Settings
+  → Connectors / custom MCP app
+  → Connection: Tunnel
+  → select the tunnel / tunnel ID
+  → Authentication: None
+```
 
 The same tunnel can be reused for several local projects by creating several profiles with the same tunnel ID and a different `--mcp-command` workspace path. Only **one backend should actively own a given tunnel at a time**. Stop the currently running profile before starting another profile that reuses the same tunnel. A profile switch changes which `nian-workspace` process is reachable; it does not make one process serve multiple roots.
 

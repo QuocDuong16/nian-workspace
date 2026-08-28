@@ -55,6 +55,19 @@ jobs:
             exit 1
           }
 
+      - name: Verify release notes heading matches tag
+        run: |
+          set -Eeuo pipefail
+          tag="${FORGEJO_REF_NAME:-${GITHUB_REF_NAME:-}}"
+          if [ -z "$tag" ]; then
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          release_heading="$(grep -m1 '^# ' RELEASE_NOTES.md || true)"
+          test "$release_heading" = "# ${tag}" || {
+            echo "RELEASE_NOTES.md heading ${release_heading:-<missing>} does not match release tag ${tag}" >&2
+            exit 1
+          }
+
       - name: Install cross-linkers and packaging tools
         run: |
           set -Eeuo pipefail
@@ -76,16 +89,25 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: |
           set -Eeuo pipefail
+          binary=target/aarch64-unknown-linux-gnu/release/nian-workspace
           cargo build --release --locked --target aarch64-unknown-linux-gnu
-          file target/aarch64-unknown-linux-gnu/release/nian-workspace
+          file_output="$(file -b "$binary")"
+          printf '%s\n' "$file_output"
+          printf '%s\n' "$file_output" | grep -Eiq '^ELF 64-bit'
+          printf '%s\n' "$file_output" | grep -Eiq '(AArch64|ARM aarch64)'
 
       - name: Build Windows x86_64 GNU release
         env:
           CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
         run: |
           set -Eeuo pipefail
+          binary=target/x86_64-pc-windows-gnu/release/nian-workspace.exe
           cargo build --release --locked --target x86_64-pc-windows-gnu
-          file target/x86_64-pc-windows-gnu/release/nian-workspace.exe
+          file_output="$(file -b "$binary")"
+          printf '%s\n' "$file_output"
+          printf '%s\n' "$file_output" | grep -Eiq 'PE32\+'
+          printf '%s\n' "$file_output" | grep -Eiq '(x86-64|x86_64)'
+          printf '%s\n' "$file_output" | grep -Eiq '(MS Windows|Windows)'
 
       - name: Package release archives and checksums
         run: |
@@ -119,7 +141,7 @@ jobs:
           (cd "$release_dir" && sha256sum ./*.tar.gz ./*.zip > SHA256SUMS && sha256sum --check SHA256SUMS)
 
       - name: Publish Forgejo release
-        uses: https://data.forgejo.org/actions/forgejo-release@v2.13.4
+        uses: https://data.forgejo.org/actions/forgejo-release@98265452477dafb3f0f27ba9c462c90b18cb44fd # v2.13.4
         with:
           direction: upload
           release-dir: dist/release
