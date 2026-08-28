@@ -106,6 +106,8 @@ ChatGPT connects to remote MCP servers rather than directly spawning a local std
 
 Create or reuse a Secure MCP Tunnel, then create a **Restricted Runtime API Key** for `tunnel-client` with only **Tunnels: Read** and **Tunnels: Use**. Do not use an Admin API key for the daemon.
 
+When the tunnel is intended for ChatGPT, assign it to the ChatGPT workspace that will use the connector; otherwise it may not appear in the Tunnel picker.
+
 Export the runtime API key and tunnel ID before configuring the local profile:
 
 ```bash
