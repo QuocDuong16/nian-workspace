@@ -66,7 +66,7 @@ impl NianWorkspaceServer {
     }
 
     #[tool(
-        description = "Fast regex/literal text search over workspace files: every match reports its workspace-relative path and line number. Results are bounded; .git/.hg/.svn are never searched, generated dirs only when requested explicitly."
+        description = "Fast regex/literal text search over workspace files: every match reports its workspace-relative path and line number. Results are bounded. Hidden and generated directories are searched only when the requested path itself enters them (e.g. '.config', 'node_modules'); .git/.hg/.svn are never searched, not even through symlinks."
     )]
     fn search(
         &self,

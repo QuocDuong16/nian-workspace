@@ -58,11 +58,11 @@ nian-workspace . --write --exec --allow-shell  # + shell syntax (cmd.exe / /bin/
 | `workspace_info` | ✔ | Root, name, permissions, Git branch |
 | `list_files` | ✔ | Bounded depth, glob filter, skips `.git`/`node_modules`/`target`/… |
 | `read_file` | ✔ | 1-based line ranges, binary detection, bounded output |
-| `search` | ✔ | Regex or literal, capped results, every match carries its workspace-relative path. `.git`/`.hg`/`.svn` are never searched — even when requested explicitly; generated dirs (`node_modules`, `target`, …) are skipped normally but searchable when you ask for them by path. |
-| `git_status` | ✔ | `git status --short --branch` equivalent |
-| `git_diff` | ✔ | Unstaged or staged diff, optional path filter, bounded |
+| `search` | ✔ | Regex or literal, capped results, every match carries its workspace-relative path. `.git`/`.hg`/`.svn` are never searched — not even through symlink aliases. Hidden and generated dirs are searched only when the requested path itself enters that territory (e.g. `path=".config"`, `path="node_modules"`); rooting at `src` does not unlock `src/.hidden` or `src/node_modules`. |
+| `git_status` | ✔ | `git status --short --branch` equivalent, paths relative to the workspace root |
+| `git_diff` | ✔ | Unstaged or staged diff, optional path filter, bounded; paths relative to the workspace root so output feeds `apply_patch` directly, even for workspaces nested inside a larger repository |
 | `apply_patch` | ✗ needs `--write` | Unified diff (`diff -u` / `git diff`). All hunks are validated before mutation, and each individual file replacement is atomic; an unexpected filesystem failure during the commit phase may leave a multi-file patch partially applied. New-file creation via `/dev/null` headers; renames/deletions rejected. Preserves existing newline style (LF/CRLF) and POSIX permission bits. |
-| `run_command` | ✗ needs `--exec` | Direct process execution (`program` + `args`), no shell interpolation. Optional `shell:true` requests need `--allow-shell`. Timeout terminates the whole process tree on Unix and Windows; stdout/stderr are capped. |
+| `run_command` | ✗ needs `--exec` | Direct process execution (`program` + `args`), no shell interpolation. Optional `shell:true` requests need `--allow-shell`. Timeout terminates the whole process tree on Unix and Windows; stdout/stderr are capped, and output emitted before the timeout is preserved up to the caps. |
 
 ## Client setup
 

@@ -16,6 +16,11 @@ use rmcp::model::{CallToolResult, ContentBlock};
 /// Version-control metadata directories. These are never searched by the
 /// search tool — not even when explicitly requested as a path (policy:
 /// exposing `.git` internals adds no value and complicates the model).
+///
+/// Matching is ASCII case-insensitive: Windows filesystems are commonly
+/// case-insensitive, so `.GIT` may be the same directory as `.git`. On
+/// case-sensitive Unix filesystems this can only over-reject a directory
+/// literally named `.GIT`, which is harmless.
 pub(crate) const VCS_METADATA_DIRS: &[&str] = &[".git", ".hg", ".svn"];
 
 /// Ordinary generated/build directories skipped during normal recursive
@@ -34,7 +39,9 @@ pub(crate) const GENERATED_DIRS: &[&str] = &[
 ];
 
 pub(crate) fn is_vcs_metadata_dir(name: &str) -> bool {
-    VCS_METADATA_DIRS.contains(&name)
+    VCS_METADATA_DIRS
+        .iter()
+        .any(|d| d.eq_ignore_ascii_case(name))
 }
 
 pub(crate) fn is_generated_dir(name: &str) -> bool {
