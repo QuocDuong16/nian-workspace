@@ -13,7 +13,7 @@
 use crate::config::AppState;
 use crate::error::{ToolError, ToolResult};
 use crate::process::ProcessTreeGuard;
-use crate::tools::{decode_lossy, read_capped};
+use crate::tools::{decode_lossy, read_capped, CappedBytes};
 use rmcp::schemars;
 use serde_json::json;
 use std::process::Stdio;
@@ -154,41 +154,38 @@ pub(crate) async fn handle(
     let started = std::time::Instant::now();
     let deadline = tokio::time::Duration::from_secs(timeout_secs);
 
-    let mut stdout_pipe = child.stdout.take().expect("stdout piped");
-    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
     let stdout_cap = limits.max_command_stdout;
     let stderr_cap = limits.max_command_stderr;
+    // Output readers run as independent tasks that own their pipes: bytes
+    // consumed before a timeout stay buffered inside the task instead of
+    // vanishing with a cancelled future. Output emitted right before a
+    // timeout is usually the most useful diagnostic, so it must survive.
+    let mut stdout_task = tokio::spawn(collect_pipe_output(
+        child.stdout.take().expect("stdout piped"),
+        stdout_cap,
+    ));
+    let mut stderr_task = tokio::spawn(collect_pipe_output(
+        child.stderr.take().expect("stderr piped"),
+        stderr_cap,
+    ));
 
-    let read_stdout = async {
-        let capped = read_capped(&mut stdout_pipe, stdout_cap).await?;
-        // Continue draining until EOF so the child never blocks on a full
-        // pipe; overflow beyond the cap is discarded in fixed-size chunks.
-        if capped.truncated {
-            drain_discard(&mut stdout_pipe).await;
-        }
-        Ok::<_, std::io::Error>(capped)
+    // Main deadline: child completion and reader EOF, whichever comes last.
+    // Expiry cancels only this future — the reader tasks keep every byte they
+    // already consumed.
+    let wait_all = async {
+        let out = (&mut stdout_task).await;
+        let err = (&mut stderr_task).await;
+        let status = child.wait().await;
+        (out, err, status)
     };
-    let read_stderr = async {
-        let capped = read_capped(&mut stderr_pipe, stderr_cap).await?;
-        if capped.truncated {
-            drain_discard(&mut stderr_pipe).await;
-        }
-        Ok::<_, std::io::Error>(capped)
-    };
-
-    let wait_result = tokio::time::timeout(deadline, async {
-        let (out, err) = tokio::join!(read_stdout, read_stderr);
-        let out_capped = out?;
-        let err_capped = err?;
-        let status = child.wait().await?;
-        Ok::<_, std::io::Error>((status, out_capped, err_capped))
-    })
-    .await;
+    let wait_result = tokio::time::timeout(deadline, wait_all).await;
 
     let duration_ms = u128_as_u64(started.elapsed().as_millis());
 
     match wait_result {
-        Ok(Ok((status, out_capped, err_capped))) => {
+        Ok((out, err, Ok(status))) => {
+            let (out_capped, out_full) = reader_outcome(Some(out));
+            let (err_capped, err_full) = reader_outcome(Some(err));
             let exit_code = exit_code_of(&status);
             let (stdout_text, stdout_lossy) = decode_lossy(&out_capped.bytes);
             let (stderr_text, _) = decode_lossy(&err_capped.bytes);
@@ -196,54 +193,61 @@ pub(crate) async fn handle(
                 "exit_code": exit_code,
                 "stdout": stdout_text,
                 "stderr": stderr_text,
-                "truncated": out_capped.truncated || err_capped.truncated,
+                "truncated": !out_full
+                    || !err_full
+                    || out_capped.truncated
+                    || err_capped.truncated,
                 "duration_ms": duration_ms,
                 "timed_out": false,
                 "lossy_decoding": stdout_lossy,
                 "signal": signal_of(&status),
             }))
         }
-        Ok(Err(e)) => Err(ToolError::msg(format!("Command I/O failed: {e}"))),
+        Ok((_, _, Err(e))) => {
+            // Reading the exit status failed; nothing worth collecting. The
+            // reader tasks are aborted so no pipe handles linger.
+            stdout_task.abort();
+            stderr_task.abort();
+            Err(ToolError::msg(format!("Command I/O failed: {e}")))
+        }
         Err(_elapsed) => {
-            // Timeout. The invariant: a command timeout bounds how long this
-            // function can remain stuck afterwards, even if an escaped
-            // descendant keeps the inherited pipes open forever.
+            // Timeout. Invariants: a command timeout bounds how long this
+            // function can remain stuck afterwards, and output emitted before
+            // the kill is preserved (it lives in the reader tasks).
             //
-            // Teardown sequence (all inside a small fixed grace deadline):
+            // Teardown sequence, all inside a small fixed grace deadline:
             //   1. terminate the whole process tree
             //   2. reap the direct child (wait)
-            //   3. drain whatever bounded output the pipes still held
-            // If the grace period expires first, everything below is simply
-            // dropped — dropping the Child also kills it, and dropping the
-            // pipe handles closes them, so cleanup can never hang forever.
+            //   3. collect the reader tasks — an escaped descendant may hold
+            //      the inherited pipe write-ends open forever, so collection
+            //      is bounded too; if the grace expires the tasks are
+            //      aborted, which also closes the pipe read-ends.
             const POST_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
             let teardown = async {
                 tree.terminate_tree(&mut child).await;
                 // Reap the direct child so it cannot linger as a zombie.
                 let reaped = child.wait().await.is_ok();
-                // Collect what was in flight when the kill landed; read_capped
-                // retains at most its cap and discards the rest chunk-wise.
-                // Pipes are owned here: if the deadline expires mid-drain the
-                // future is dropped and closing them takes care of cleanup.
-                let out = read_capped(&mut stdout_pipe, stdout_cap)
-                    .await
-                    .unwrap_or_else(|_| empty_capped());
-                let err = read_capped(&mut stderr_pipe, stderr_cap)
-                    .await
-                    .unwrap_or_else(|_| empty_capped());
+                let out = (&mut stdout_task).await;
+                let err = (&mut stderr_task).await;
                 (reaped, out, err)
             };
+            let teardown_result = tokio::time::timeout(POST_KILL_GRACE, teardown).await;
 
-            let (reaped, remaining_out, remaining_err) =
-                match tokio::time::timeout(POST_KILL_GRACE, teardown).await {
-                    Ok((reaped, out, err)) => (reaped, out, err),
-                    Err(_) => {
-                        tracing::warn!(timeout_secs, "post-kill cleanup exceeded its grace period");
-                        (false, empty_capped(), empty_capped())
-                    }
-                };
-            let cleaned_up = reaped;
+            let (reaped, out_res, err_res) = match teardown_result {
+                Ok((reaped, out, err)) => (reaped, Some(out), Some(err)),
+                Err(_) => {
+                    // Grace expired: abort the reader tasks so nothing
+                    // lingers behind an escaped pipe-holder.
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    tracing::warn!(timeout_secs, "post-kill cleanup exceeded its grace period");
+                    (false, None, None)
+                }
+            };
+            let (remaining_out, out_full) = reader_outcome(out_res);
+            let (remaining_err, err_full) = reader_outcome(err_res);
+            let cleaned_up = reaped && out_full && err_full;
 
             tracing::warn!(
                 timeout_secs,
@@ -256,12 +260,19 @@ pub(crate) async fn handle(
                 "exit_code": null,
                 "stdout": stdout_text,
                 "stderr": stderr_text,
-                "truncated": true,
+                "truncated": !out_full
+                    || !err_full
+                    || remaining_out.truncated
+                    || remaining_err.truncated,
                 "duration_ms": u128_as_u64(started.elapsed().as_millis()),
                 "timed_out": true,
                 "message": format!(
                     "Command exceeded the {timeout_secs} second timeout and was terminated{}.",
-                    if cleaned_up && reaped { "" } else { "; some post-kill cleanup did not finish within its grace period" }
+                    if cleaned_up {
+                        ""
+                    } else {
+                        "; some post-kill cleanup did not finish within its grace period"
+                    }
                 ),
             }))
         }
@@ -306,10 +317,46 @@ fn shell_command(command_line: &str) -> Command {
     }
 }
 
-fn empty_capped() -> crate::tools::CappedBytes {
-    crate::tools::CappedBytes {
+fn empty_capped() -> CappedBytes {
+    CappedBytes {
         bytes: Vec::new(),
         truncated: false,
+    }
+}
+
+/// Read one pipe up to `cap`, then drain the remainder to EOF in fixed-size
+/// chunks so a chatty child never blocks on a full pipe. Runs as its own
+/// spawned task, so output consumed before a timeout stays buffered there
+/// instead of being lost with a cancelled future.
+async fn collect_pipe_output(
+    mut pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    cap: usize,
+) -> std::io::Result<CappedBytes> {
+    let capped = read_capped(&mut pipe, cap).await?;
+    if capped.truncated {
+        drain_discard(&mut pipe).await;
+    }
+    Ok(capped)
+}
+
+/// Flatten one reader task's result into `(buffer, collected_fully)`. Anything
+/// other than a clean EOF-with-buffer — I/O error, task panic, or collection
+/// cut short by the cleanup grace — counts as incomplete and is surfaced
+/// through the public `truncated` flag rather than silently dropped.
+fn reader_outcome(
+    res: Option<Result<Result<CappedBytes, std::io::Error>, tokio::task::JoinError>>,
+) -> (CappedBytes, bool) {
+    match res {
+        Some(Ok(Ok(capped))) => (capped, true),
+        Some(Ok(Err(e))) => {
+            tracing::warn!("command output pipe read failed: {e}");
+            (empty_capped(), false)
+        }
+        Some(Err(join)) => {
+            tracing::warn!("command output reader failed: {join}");
+            (empty_capped(), false)
+        }
+        None => (empty_capped(), false),
     }
 }
 
@@ -417,6 +464,81 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn output_emitted_before_timeout_is_preserved() {
+        let (_t, state) = exec_state();
+        let out = run(
+            &state,
+            RunCommandArgs {
+                program: Some("sh".into()),
+                args: Some(vec![
+                    "-c".into(),
+                    "echo important-diagnostic; echo err-diagnostic >&2; sleep 30".into(),
+                ]),
+                shell: false,
+                command: None,
+                cwd: None,
+                timeout_seconds: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["timed_out"], json!(true));
+        let stdout = out["stdout"].as_str().unwrap();
+        assert!(
+            stdout.contains("important-diagnostic"),
+            "stdout emitted before the timeout was lost: {stdout:?}"
+        );
+        let stderr = out["stderr"].as_str().unwrap();
+        assert!(
+            stderr.contains("err-diagnostic"),
+            "stderr emitted before the timeout was lost: {stderr:?}"
+        );
+        // Everything was collected and nothing discarded: the truncation
+        // flag must reflect that instead of being forced true.
+        assert_eq!(out["truncated"], json!(false));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_before_timeout_remains_bounded() {
+        // Emits far more than the cap, then hangs: the retained portion must
+        // still respect the cap and report truncation.
+        let tmp = TempDir::new().unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        let state = AppState::new(
+            ws,
+            Permissions::from_flags(true, true, false).unwrap(),
+            Limits {
+                max_command_stdout: 256,
+                ..Limits::default()
+            },
+        );
+        let out = run(
+            &state,
+            RunCommandArgs {
+                program: Some("sh".into()),
+                args: Some(vec![
+                    "-c".into(),
+                    format!(
+                        "for i in $(seq 1 200); do echo '{}'; done; sleep 30",
+                        "y".repeat(40)
+                    ),
+                ]),
+                shell: false,
+                command: None,
+                cwd: None,
+                timeout_seconds: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["timed_out"], json!(true));
+        assert!(out["stdout"].as_str().unwrap().len() <= 256);
+        assert_eq!(out["truncated"], json!(true));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn timeout_terminates_descendants_of_the_child() {
         // The shell spawns a grandchild; both must be gone after the timeout
         // fires. The grandchild writes a marker only if it is still alive
@@ -485,6 +607,10 @@ mod tests {
             "run_command stayed stuck {:?} after its own deadline",
             elapsed
         );
+        // The escaped pipe-holder prevented full output collection within
+        // the grace period; the response must say so instead of pretending.
+        assert_eq!(out["truncated"], json!(true));
+        assert!(out["message"].as_str().unwrap().contains("grace period"));
     }
 
     #[cfg(unix)]
