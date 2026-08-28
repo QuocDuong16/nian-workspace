@@ -40,6 +40,11 @@ pub(crate) fn git_status(state: &AppState, _args: GitStatusArgs) -> ToolResult<s
     // would report changes for the WHOLE repository (git discovers the repo
     // root upward). Restricting to "." keeps output inside the configured
     // workspace, no matter where the enclosing repo extends.
+    //
+    // Path text is pinned workspace-relative by the shared hardened config
+    // (`-c status.relativePaths=true`); a user's global `relativePaths=false`
+    // would otherwise leak the enclosing repo's directory prefix into every
+    // line.
     let out = run_git_bounded(&GitInvocation {
         root: ws.root(),
         args: &["--no-pager", "status", "--short", "--branch", "--", "."],
@@ -72,6 +77,12 @@ pub(crate) fn git_diff(state: &AppState, args: GitDiffArgs) -> ToolResult<serde_
     // repository (diff.external, diff.<driver>.textconv in .git/config or
     // attributes) to execute an external program during our diff.
     //
+    // --relative renders a/ and b/ headers relative to the invocation cwd
+    // (pinned to the workspace root), not the enclosing repository root, so
+    // a nested workspace's diff can be fed straight into apply_patch —
+    // whose paths resolve against the workspace root — without producing a
+    // workspace/workspace/… target.
+    //
     // Trailing pathspec: a specific workspace-relative path when given
     // (already validated through Workspace::resolve), otherwise "." — the
     // same scoping rule as git_status. ../ or absolute external pathspecs
@@ -82,6 +93,7 @@ pub(crate) fn git_diff(state: &AppState, args: GitDiffArgs) -> ToolResult<serde_
         "--no-color",
         "--no-ext-diff",
         "--no-textconv",
+        "--relative",
     ];
     if args.staged {
         cmd_args.push("--cached");
@@ -123,6 +135,7 @@ mod tests {
     use super::*;
     use crate::config::Limits;
     use crate::permissions::Permissions;
+    use crate::tools::patch;
     use crate::workspace::Workspace;
     use std::path::Path;
     use std::process::Command as StdCommand;
@@ -561,5 +574,129 @@ mod tests {
                 "'{attempt}' should be rejected as a pathspec, got: {msg}"
             );
         }
+    }
+
+    // -- workspace-relative path rendering -----------------------------------
+
+    #[test]
+    fn status_paths_are_workspace_relative_in_a_nested_repo() {
+        let (_t, state) = parent_repo_state();
+        let root = state.workspace().root().to_path_buf();
+        std::fs::write(root.join("inside.txt"), "modified\n").unwrap();
+        std::fs::write(root.join("untracked.txt"), "new\n").unwrap();
+
+        let out = git_status(&state, GitStatusArgs {}).unwrap();
+        let output = out["output"].as_str().unwrap();
+        assert!(
+            output.contains(" M inside.txt") && output.contains("?? untracked.txt"),
+            "status paths must be workspace-relative: {output}"
+        );
+        assert!(
+            !output.contains("workspace/"),
+            "status leaked the enclosing repo's directory prefix: {output}"
+        );
+        assert!(
+            !output.contains("outside.txt"),
+            "out-of-workspace change leaked: {output}"
+        );
+    }
+
+    #[test]
+    fn diff_paths_are_workspace_relative_in_a_nested_repo() {
+        let (_t, state) = parent_repo_state();
+        let root = state.workspace().root().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/inside.txt"), "original\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "add src file"]);
+        std::fs::write(root.join("src/inside.txt"), "modified\n").unwrap();
+
+        let out = git_diff(
+            &state,
+            GitDiffArgs {
+                staged: false,
+                path: None,
+            },
+        )
+        .unwrap();
+        let diff = out["diff"].as_str().unwrap();
+        assert!(
+            diff.contains("--- a/src/inside.txt") && diff.contains("+++ b/src/inside.txt"),
+            "diff headers must be workspace-relative: {diff}"
+        );
+        assert!(
+            !diff.contains("workspace/src/inside.txt"),
+            "diff leaked the enclosing repo's directory prefix: {diff}"
+        );
+
+        // The same holds for the staged view.
+        git(&root, &["add", "."]);
+        let staged = git_diff(
+            &state,
+            GitDiffArgs {
+                staged: true,
+                path: None,
+            },
+        )
+        .unwrap();
+        let diff = staged["diff"].as_str().unwrap();
+        assert!(
+            diff.contains("+++ b/src/inside.txt") && !diff.contains("workspace/"),
+            "staged diff headers must be workspace-relative: {diff}"
+        );
+    }
+
+    #[test]
+    fn git_diff_output_applies_via_apply_patch_in_a_nested_workspace() {
+        // The two core tools must compose: a diff captured from a workspace
+        // nested inside a larger repository feeds apply_patch against the
+        // same workspace without creating a workspace/workspace/… path.
+        let (_t, state) = parent_repo_state();
+        let root = state.workspace().root().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/notes.txt"), "alpha\nbeta\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "add notes"]);
+
+        // 1. Modify the file and capture the diff.
+        std::fs::write(root.join("src/notes.txt"), "alpha\ngamma\n").unwrap();
+        let out = git_diff(
+            &state,
+            GitDiffArgs {
+                staged: false,
+                path: None,
+            },
+        )
+        .unwrap();
+        let diff = out["diff"].as_str().unwrap().to_string();
+        assert!(diff.contains("b/src/notes.txt"), "diff missing: {diff}");
+
+        // 2. Restore the original content, so the patch applies against it.
+        std::fs::write(root.join("src/notes.txt"), "alpha\nbeta\n").unwrap();
+
+        // 3. Feed the diff into apply_patch (write permission required).
+        let writable = AppState::new(
+            state.workspace().clone(),
+            Permissions::from_flags(true, false, false).unwrap(),
+            Limits::default(),
+        );
+        patch::handle(
+            &writable,
+            patch::ApplyPatchArgs {
+                patch: diff.clone(),
+            },
+        )
+        .expect("git_diff output must apply cleanly via apply_patch");
+
+        // 4. The intended workspace file was modified; no stray
+        //    workspace/workspace path exists.
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/notes.txt")).unwrap(),
+            "alpha\ngamma\n"
+        );
+        assert!(
+            !root.join("workspace").exists(),
+            "apply_patch created a workspace/workspace path from repo-root-relative headers"
+        );
     }
 }

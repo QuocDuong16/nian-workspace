@@ -122,7 +122,7 @@ impl NianWorkspaceServer {
     }
 
     #[tool(
-        description = "Show the unified diff of unstaged changes (or staged ones with staged=true), optionally limited to one path. Output is bounded."
+        description = "Show the unified diff of unstaged changes (or staged ones with staged=true), optionally limited to one path. Diff paths are relative to the workspace root, so output can be fed into apply_patch directly. Output is bounded."
     )]
     fn git_diff(
         &self,

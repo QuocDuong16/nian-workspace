@@ -39,7 +39,8 @@ const STRIPPED_GIT_ENV: &[&str] = &[
 ];
 
 /// Config overrides applied to every invocation so neither repository-local
-/// `.git/config` nor user/system config can re-enable these execution paths.
+/// `.git/config` nor user/system config can re-enable these execution paths
+/// or change path semantics.
 const HARDENED_CONFIG: &[&str] = &[
     "-c",
     "core.fsmonitor=false",
@@ -49,6 +50,12 @@ const HARDENED_CONFIG: &[&str] = &[
     "pager.diff=false",
     "-c",
     "pager.status=false",
+    // Status paths must stay relative to the invocation cwd (the workspace
+    // root) even when the user's global config sets relativePaths=false,
+    // which would otherwise print paths prefixed with the enclosing
+    // repository's directories.
+    "-c",
+    "status.relativePaths=true",
 ];
 
 #[derive(Debug)]
