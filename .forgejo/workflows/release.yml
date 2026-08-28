@@ -72,7 +72,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           apt-get update
-          apt-get install --yes --no-install-recommends file gcc-aarch64-linux-gnu gcc-mingw-w64-x86-64 zip
+          apt-get install --yes --no-install-recommends file gcc-aarch64-linux-gnu libc6-dev-arm64-cross gcc-mingw-w64-x86-64 zip
           rm -rf /var/lib/apt/lists/*
           rustup target add aarch64-unknown-linux-gnu x86_64-pc-windows-gnu
 
