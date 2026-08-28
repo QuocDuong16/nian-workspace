@@ -120,6 +120,24 @@ impl ProcessTreeGuard {
         // direct child is dead on both platforms before it is reaped.
         let _ = finish_child.start_kill();
     }
+
+    /// Terminate whatever still remains of the contained tree — used after
+    /// the direct child has already exited on its own, to clean up descendants
+    /// that keep inherited pipe handles open. Never touches the direct child
+    /// (it is gone by construction), and this is cleanup, not a timeout.
+    pub(crate) fn terminate_remaining_descendants(&self) {
+        match &self.inner {
+            #[cfg(unix)]
+            GuardInner::Unix { pgid } if *pgid != 0 => unix::kill_process_group(*pgid),
+            #[cfg(windows)]
+            GuardInner::Windows { job } if *job != 0 => windows::terminate_job(*job),
+            _ => {
+                tracing::warn!(
+                    "process-tree containment unavailable; leftover descendants were not terminated"
+                );
+            }
+        }
+    }
 }
 
 impl Drop for ProcessTreeGuard {

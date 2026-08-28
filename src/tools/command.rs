@@ -160,36 +160,65 @@ pub(crate) async fn handle(
     // consumed before a timeout stay buffered inside the task instead of
     // vanishing with a cancelled future. Output emitted right before a
     // timeout is usually the most useful diagnostic, so it must survive.
-    let mut stdout_task = tokio::spawn(collect_pipe_output(
+    // The AbortOnDrop wrapper guarantees a cancelled run_command call can
+    // never leave them detached.
+    let mut stdout_task = AbortOnDrop::spawn(read_capped(
         child.stdout.take().expect("stdout piped"),
         stdout_cap,
     ));
-    let mut stderr_task = tokio::spawn(collect_pipe_output(
+    let mut stderr_task = AbortOnDrop::spawn(read_capped(
         child.stderr.take().expect("stderr piped"),
         stderr_cap,
     ));
 
-    // Main deadline: child completion and reader EOF, whichever comes last.
-    // Expiry cancels only this future — the reader tasks keep every byte they
-    // already consumed.
-    let wait_all = async {
-        let out = (&mut stdout_task).await;
-        let err = (&mut stderr_task).await;
-        let status = child.wait().await;
-        (out, err, status)
-    };
-    let wait_result = tokio::time::timeout(deadline, wait_all).await;
-
-    let duration_ms = u128_as_u64(started.elapsed().as_millis());
+    // Main deadline: the lifetime of the DIRECT command process — nothing
+    // else. A descendant that inherits the pipe write-ends must never turn a
+    // completed command into a timeout.
+    let wait_result = tokio::time::timeout(deadline, child.wait()).await;
 
     match wait_result {
-        Ok((out, err, Ok(status))) => {
-            let (out_capped, out_full) = reader_outcome(Some(out));
-            let (err_capped, err_full) = reader_outcome(Some(err));
+        Ok(Ok(status)) => {
+            let drain_result = tokio::time::timeout(
+                POST_EXIT_DRAIN_GRACE,
+                collect_readers(&mut stdout_task, &mut stderr_task),
+            )
+            .await;
+            let (out_res, err_res) = match drain_result {
+                Ok((out, err)) => (Some(out), Some(err)),
+                Err(_) => {
+                    // Descendants still hold the pipes: terminate the
+                    // remaining contained tree so their handles close, then
+                    // allow one final short collection window. This is
+                    // leftover cleanup — never a command timeout.
+                    tracing::debug!(
+                        "output pipes still open after child exit; terminating leftover descendants"
+                    );
+                    tree.terminate_remaining_descendants();
+                    match tokio::time::timeout(
+                        POST_EXIT_DRAIN_GRACE,
+                        collect_readers(&mut stdout_task, &mut stderr_task),
+                    )
+                    .await
+                    {
+                        Ok((out, err)) => (Some(out), Some(err)),
+                        Err(_) => {
+                            // Escaped pipe-holder: abort the readers and
+                            // report the honest, incomplete state.
+                            stdout_task.abort();
+                            stderr_task.abort();
+                            tracing::warn!("output collection incomplete after normal child exit");
+                            (None, None)
+                        }
+                    }
+                }
+            };
+
+            let (out_capped, out_full) = reader_outcome(out_res);
+            let (err_capped, err_full) = reader_outcome(err_res);
             let exit_code = exit_code_of(&status);
             let (stdout_text, stdout_lossy) = decode_lossy(&out_capped.bytes);
             let (stderr_text, _) = decode_lossy(&err_capped.bytes);
-            Ok(json!({
+            let mut result = json!({
                 "exit_code": exit_code,
                 "stdout": stdout_text,
                 "stderr": stderr_text,
@@ -197,13 +226,19 @@ pub(crate) async fn handle(
                     || !err_full
                     || out_capped.truncated
                     || err_capped.truncated,
-                "duration_ms": duration_ms,
+                "duration_ms": u128_as_u64(started.elapsed().as_millis()),
                 "timed_out": false,
                 "lossy_decoding": stdout_lossy,
                 "signal": signal_of(&status),
-            }))
+            });
+            if !(out_full && err_full) {
+                result["message"] = json!(
+                    "Command exited, but output collection was incomplete because descendant processes kept pipe handles open."
+                );
+            }
+            Ok(result)
         }
-        Ok((_, _, Err(e))) => {
+        Ok(Err(e)) => {
             // Reading the exit status failed; nothing worth collecting. The
             // reader tasks are aborted so no pipe handles linger.
             stdout_task.abort();
@@ -324,28 +359,72 @@ fn empty_capped() -> CappedBytes {
     }
 }
 
-/// Read one pipe up to `cap`, then drain the remainder to EOF in fixed-size
-/// chunks so a chatty child never blocks on a full pipe. Runs as its own
-/// spawned task, so output consumed before a timeout stays buffered there
-/// instead of being lost with a cancelled future.
-async fn collect_pipe_output(
-    mut pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
-    cap: usize,
-) -> std::io::Result<CappedBytes> {
-    let capped = read_capped(&mut pipe, cap).await?;
-    if capped.truncated {
-        drain_discard(&mut pipe).await;
+/// Fixed grace for collecting pipe output after the direct child has exited.
+/// EOF normally arrives within milliseconds of exit; only a descendant that
+/// inherited the write-ends can delay it, and the remaining tree is
+/// terminated when this window lapses. Not user-configurable in v0.1.
+const POST_EXIT_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// RAII wrapper around a spawned reader task: dropping the guard aborts the
+/// task, so a cancelled `run_command` future (client disconnect, transport or
+/// server shutdown) can never leave detached tasks blocked on pipes forever.
+/// Awaiting yields the task's result; aborting a finished task is a no-op.
+struct AbortOnDrop<T> {
+    handle: tokio::task::JoinHandle<T>,
+}
+
+impl<T> AbortOnDrop<T> {
+    fn spawn(task: impl std::future::Future<Output = T> + Send + 'static) -> Self
+    where
+        T: Send + 'static,
+    {
+        Self {
+            handle: tokio::spawn(task),
+        }
     }
-    Ok(capped)
+
+    fn abort(&self) {
+        self.handle.abort();
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.handle).poll(cx)
+    }
+}
+
+/// One reader task's result: the bounded buffer, or why it could not be
+/// obtained (pipe I/O error or task failure).
+type ReaderResult = Result<Result<CappedBytes, std::io::Error>, tokio::task::JoinError>;
+
+/// Await both reader tasks for their final buffers. Called with a fresh
+/// borrow each time it is (re)tried within a grace deadline.
+async fn collect_readers(
+    stdout_task: &mut AbortOnDrop<std::io::Result<CappedBytes>>,
+    stderr_task: &mut AbortOnDrop<std::io::Result<CappedBytes>>,
+) -> (ReaderResult, ReaderResult) {
+    let out = stdout_task.await;
+    let err = stderr_task.await;
+    (out, err)
 }
 
 /// Flatten one reader task's result into `(buffer, collected_fully)`. Anything
 /// other than a clean EOF-with-buffer — I/O error, task panic, or collection
-/// cut short by the cleanup grace — counts as incomplete and is surfaced
+/// cut short by a grace deadline — counts as incomplete and is surfaced
 /// through the public `truncated` flag rather than silently dropped.
-fn reader_outcome(
-    res: Option<Result<Result<CappedBytes, std::io::Error>, tokio::task::JoinError>>,
-) -> (CappedBytes, bool) {
+fn reader_outcome(res: Option<ReaderResult>) -> (CappedBytes, bool) {
     match res {
         Some(Ok(Ok(capped))) => (capped, true),
         Some(Ok(Err(e))) => {
@@ -357,20 +436,6 @@ fn reader_outcome(
             (empty_capped(), false)
         }
         None => (empty_capped(), false),
-    }
-}
-
-/// Discard everything left on a pipe in fixed-size chunks — never collects
-/// unbounded output into memory. Errors are ignored: this runs when the
-/// process is being torn down anyway.
-async fn drain_discard(pipe: &mut (impl tokio::io::AsyncRead + Unpin)) {
-    use tokio::io::AsyncReadExt;
-    let mut sink = [0u8; 16 * 1024];
-    loop {
-        match pipe.read(&mut sink).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
     }
 }
 
@@ -535,6 +600,137 @@ mod tests {
         assert_eq!(out["timed_out"], json!(true));
         assert!(out["stdout"].as_str().unwrap().len() <= 256);
         assert_eq!(out["truncated"], json!(true));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_pipe_holder_does_not_cause_a_timeout() {
+        // The direct shell exits 0 almost immediately while the background
+        // sleep inherits stdout/stderr and holds them for 10s. The command
+        // must be reported as completed — never as a timeout.
+        let (_t, state) = exec_state();
+        let started = std::time::Instant::now();
+        let out = run(
+            &state,
+            RunCommandArgs {
+                program: Some("sh".into()),
+                args: Some(vec!["-c".into(), "sleep 10 & exit 0".into()]),
+                shell: false,
+                command: None,
+                cwd: None,
+                timeout_seconds: Some(2),
+            },
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(out["timed_out"], json!(false));
+        assert_eq!(out["exit_code"], json!(0));
+        assert!(
+            elapsed < std::time::Duration::from_secs(9),
+            "run_command waited for the background pipe holder: {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_before_background_holder_exit_is_preserved() {
+        let (_t, state) = exec_state();
+        let out = run(
+            &state,
+            RunCommandArgs {
+                program: Some("sh".into()),
+                args: Some(vec!["-c".into(), "echo marker; sleep 10 & exit 0".into()]),
+                shell: false,
+                command: None,
+                cwd: None,
+                timeout_seconds: Some(2),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["timed_out"], json!(false));
+        assert_eq!(out["exit_code"], json!(0));
+        assert!(
+            out["stdout"].as_str().unwrap().contains("marker"),
+            "output emitted before the holder was killed was lost"
+        );
+        // Killing the leftover descendant closed the pipes, so the readers
+        // finished with everything they consumed and nothing was discarded.
+        assert_eq!(out["truncated"], json!(false));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn escaped_pipe_holder_cannot_turn_normal_exit_into_timeout() {
+        // A setsid descendant escapes containment, so killing the tree cannot
+        // close the pipes. The command still reports its real, successful
+        // exit; collection is flagged incomplete instead.
+        let (_t, state) = exec_state();
+        let started = std::time::Instant::now();
+        let out = run(
+            &state,
+            RunCommandArgs {
+                program: Some("sh".into()),
+                args: Some(vec!["-c".into(), "setsid sleep 5 &\nexit 0".into()]),
+                shell: false,
+                command: None,
+                cwd: None,
+                timeout_seconds: Some(2),
+            },
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(out["timed_out"], json!(false));
+        assert_eq!(out["exit_code"], json!(0));
+        assert!(
+            elapsed < std::time::Duration::from_secs(9),
+            "run_command stayed stuck {:?} on an escaped pipe holder",
+            elapsed
+        );
+        assert_eq!(out["truncated"], json!(true));
+        assert!(
+            out["message"]
+                .as_str()
+                .unwrap()
+                .contains("output collection was incomplete"),
+            "missing incomplete-collection explanation: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_guard_aborts_task_when_dropped() {
+        // The abort-on-drop wrapper must cancel its task instead of letting
+        // it detach: dropping the future fires the captured flag.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct Flag(Arc<AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let task_flag = Flag(flag.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = AbortOnDrop::spawn(async move {
+            let _dropped_when_aborted = task_flag;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap(); // task is running and parked forever
+        drop(task); // must abort, not detach
+
+        // Aborting drops the task's future, which fires the flag. Generous
+        // window: the assert only fails if the abort never happens.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "dropping the guard must abort the reader task"
+        );
     }
 
     #[cfg(unix)]
