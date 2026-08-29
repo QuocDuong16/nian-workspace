@@ -144,5 +144,7 @@ jobs:
         uses: https://data.forgejo.org/actions/forgejo-release@98265452477dafb3f0f27ba9c462c90b18cb44fd # v2.13.4
         with:
           direction: upload
+          url: http://172.30.0.10:3000
           release-dir: dist/release
           release-notes-file: RELEASE_NOTES.md
+          override: true
