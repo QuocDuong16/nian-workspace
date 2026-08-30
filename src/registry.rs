@@ -13,19 +13,28 @@
 //! 1. `version` exists and equals `1`;
 //! 2. at least one workspace is declared;
 //! 3. every workspace id is valid (see [`WorkspaceId::parse`]);
-//! 4. every root exists;
-//! 5. every root canonicalizes successfully;
-//! 6. every root is a directory;
-//! 7. duplicate canonical roots are rejected (including symlink aliases);
-//! 8. overlapping/nested canonical roots are rejected in both directions —
-//!    a broader writable workspace would otherwise bypass a narrower
-//!    read-only one;
+//! 4. every root is an absolute path — a relative root would make the
+//!    security policy depend on the directory the server happened to be
+//!    started from;
+//! 5. every root exists and is a directory;
+//! 6. every root canonicalizes successfully;
+//! 7. duplicate roots — two spellings of the same filesystem directory,
+//!    including symlink aliases and case-variant spellings on a
+//!    case-insensitive filesystem — are rejected;
+//! 8. nested/overlapping roots are rejected in both directions using real
+//!    filesystem ancestry — a broader writable workspace would otherwise
+//!    bypass a narrower read-only one;
 //! 9. `allow_shell = true` requires `exec = true`;
 //! 10. unknown/malformed fields fail via strict TOML deserialization.
 //!
-//! Containment checks use filesystem path/component semantics (never a raw
-//! string-prefix comparison, so `project` and `project-other` are siblings,
-//! not a nesting violation), honoring platform path-case behavior.
+//! Rules 7 and 8 use **filesystem identity**, never path strings or string
+//! case folding: the OS reports whether two paths denote the same directory
+//! (device + inode on Unix, volume serial + file index on Windows). Two
+//! genuinely distinct directories therefore never collide, even when their
+//! names differ only by case on a case-sensitive filesystem, and sibling
+//! names such as `project` and `project-other` are not nesting. A root that
+//! cannot be probed aborts startup instead of being silently treated as
+//! "different".
 
 use crate::permissions::Permissions;
 use crate::workspace::{Workspace, WorkspaceContext};
@@ -33,7 +42,6 @@ use crate::workspace_id::WorkspaceId;
 use anyhow::{bail, Context};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -105,7 +113,7 @@ impl WorkspaceRegistry {
     }
 
     /// Validate every declared workspace, then reject duplicate or nested
-    /// canonical roots, and only then freeze the registry.
+    /// roots by filesystem identity, and only then freeze the registry.
     fn build(config: WorkspaceConfigFile) -> anyhow::Result<Self> {
         if config.version != SUPPORTED_CONFIG_VERSION {
             bail!(
@@ -120,7 +128,8 @@ impl WorkspaceRegistry {
 
         // BTreeMap keys iterate in sorted order, so validation errors are
         // deterministic across runs regardless of declaration order.
-        let mut contexts: Vec<(WorkspaceId, PathBuf, Arc<WorkspaceContext>)> = Vec::new();
+        let mut contexts: Vec<(WorkspaceId, PathBuf, Arc<WorkspaceContext>, FsIdentity)> =
+            Vec::new();
         for (raw_id, entry) in &config.workspaces {
             let id = WorkspaceId::parse(raw_id).map_err(anyhow::Error::msg)?;
 
@@ -128,6 +137,15 @@ impl WorkspaceRegistry {
                 bail!(
                     "Workspace '{id}': allow_shell = true requires exec = true. \
                      Shell execution is a superset of program execution."
+                );
+            }
+
+            if !entry.root.is_absolute() {
+                bail!(
+                    "Workspace '{id}': root '{}' is a relative path. Registry roots \
+                     must be absolute so the policy cannot change with the server's \
+                     working directory.",
+                    entry.root.display()
                 );
             }
 
@@ -146,6 +164,7 @@ impl WorkspaceRegistry {
                     entry.root.display()
                 );
             }
+            let identity = FsIdentity::probe(&canonical)?;
 
             let permissions = Permissions {
                 read: true,
@@ -157,40 +176,43 @@ impl WorkspaceRegistry {
                 id.clone(),
                 canonical,
                 Arc::new(WorkspaceContext::new(Some(id), resolver, permissions)),
+                identity,
             ));
         }
 
-        // Duplicate and nested canonical roots are rejected in both
-        // directions; comparisons use canonical paths so symlink aliases
-        // cannot smuggle a second registration of the same directory in.
+        // Duplicate and nested roots are rejected in both directions using
+        // filesystem identity, so symlink aliases and case-variant spellings
+        // cannot smuggle a second registration of the same directory in,
+        // while genuinely distinct directories never collide. A probe error
+        // aborts startup: an unobservable comparison must not default to
+        // "different".
         for i in 0..contexts.len() {
             for j in (i + 1)..contexts.len() {
-                let (id_a, path_a, _) = &contexts[i];
-                let (id_b, path_b, _) = &contexts[j];
-                let (a, b) = (path_a, path_b);
-                if path_contains(a, b) && path_contains(b, a) {
+                let (id_a, root_a, _, identity_a) = &contexts[i];
+                let (id_b, root_b, _, identity_b) = &contexts[j];
+                if identity_a.same_as(identity_b) {
                     bail!(
-                        "Workspaces '{id_a}' and '{id_b}' resolve to the same canonical root '{}'. \
+                        "Workspaces '{id_a}' and '{id_b}' resolve to the same directory ('{}'). \
                          Every workspace must have a distinct root.",
-                        a.display()
+                        root_a.display()
                     );
                 }
-                if path_contains(a, b) {
+                if identity_within(identity_a, root_b)? {
                     bail!(
                         "Workspace '{id_b}' root '{}' is nested inside workspace '{id_a}' root '{}'. \
                          Nested workspace roots are forbidden: a broader writable workspace would \
                          bypass a narrower read-only one.",
-                        b.display(),
-                        a.display()
+                        root_b.display(),
+                        root_a.display()
                     );
                 }
-                if path_contains(b, a) {
+                if identity_within(identity_b, root_a)? {
                     bail!(
                         "Workspace '{id_a}' root '{}' is nested inside workspace '{id_b}' root '{}'. \
                          Nested workspace roots are forbidden: a broader writable workspace would \
                          bypass a narrower read-only one.",
-                        a.display(),
-                        b.display()
+                        root_a.display(),
+                        root_b.display()
                     );
                 }
             }
@@ -198,47 +220,64 @@ impl WorkspaceRegistry {
 
         let workspaces = contexts
             .into_iter()
-            .map(|(id, _, ctx)| (id, ctx))
+            .map(|(id, _, ctx, _)| (id, ctx))
             .collect::<HashMap<_, _>>();
         tracing::debug!(count = workspaces.len(), "workspace registry built");
         Ok(Self { workspaces })
     }
 }
 
-/// Component-wise containment check: `child` is inside or equal to `parent`.
+/// Filesystem identity of an existing path, used for security-sensitive
+/// root comparison during registry validation.
 ///
-/// Both inputs are canonical paths (absolute, no `.`/`..`), so comparing
-/// `Components` element-wise is exact — and unlike `String::starts_with`,
-/// sibling names such as `project` and `project-other` never collide.
-fn path_contains(parent: &Path, child: &Path) -> bool {
-    let mut parent_components = parent.components();
-    let mut child_components = child.components();
-    loop {
-        match (parent_components.next(), child_components.next()) {
-            // Parent exhausted: everything matched (or parent was empty).
-            (None, _) => return true,
-            // Child exhausted while the parent still has components.
-            (Some(_), None) => return false,
-            (Some(p), Some(c)) => {
-                if !component_equivalent(p.as_os_str(), c.as_os_str()) {
-                    return false;
-                }
-            }
-        }
+/// Comparison never consults path strings or case folding: the OS-level
+/// identity (device + inode on Unix, volume serial + file index on Windows)
+/// makes two roots that denote the same directory — through symlinks, or
+/// through differently-cased spellings on a case-insensitive volume —
+/// compare equal, while genuinely distinct directories never collide
+/// regardless of how similarly they are named. This deliberately avoids
+/// assuming that a whole platform's filesystems share one case behavior.
+struct FsIdentity(same_file::Handle);
+
+impl FsIdentity {
+    /// Probe identity, failing loudly: startup validation that cannot
+    /// observe the filesystem must abort rather than guess "different".
+    fn probe(path: &Path) -> anyhow::Result<Self> {
+        same_file::Handle::from_path(path)
+            .map(Self)
+            .with_context(|| {
+                format!(
+                    "Failed to inspect filesystem identity of '{}' while validating \
+                     workspace roots.",
+                    path.display()
+                )
+            })
+    }
+
+    /// True when both handles denote the same on-disk object.
+    fn same_as(&self, other: &FsIdentity) -> bool {
+        self.0 == other.0
     }
 }
 
-/// Compare two path components, honoring platform filesystem semantics:
-/// case-insensitively on Windows and macOS (case-insensitive filesystems by
-/// default), exactly everywhere else.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-fn component_equivalent(a: &OsStr, b: &OsStr) -> bool {
-    a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn component_equivalent(a: &OsStr, b: &OsStr) -> bool {
-    a == b
+/// True when `ancestor`'s identity appears on `candidate`'s real ancestor
+/// chain (strictly above it; equality is decided by identity comparison at
+/// the call site).
+///
+/// `candidate` must be a canonical path, so its `Path::parent` chain is the
+/// actual on-disk hierarchy — symlink resolution has already happened — and
+/// every ancestor therefore exists, making each probe sound. This is what
+/// keeps sibling names such as `project` and `project-other` distinct: the
+/// chain of `project-other` never passes through `project`.
+fn identity_within(ancestor: &FsIdentity, candidate: &Path) -> anyhow::Result<bool> {
+    let mut current = candidate.parent();
+    while let Some(dir) = current {
+        if FsIdentity::probe(dir)?.same_as(ancestor) {
+            return Ok(true);
+        }
+        current = dir.parent();
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -461,7 +500,7 @@ mod tests {
             ("one", &ws, ""),
             ("two", &alias_spelling, ""),
         ]));
-        assert!(err.contains("same canonical root"), "{err}");
+        assert!(err.contains("same directory"), "{err}");
     }
 
     #[cfg(unix)]
@@ -473,7 +512,73 @@ mod tests {
         let link = tmp.path().join("alias");
         symlink(&real, &link).unwrap();
         let err = build_err(&config_for(&[("real", &real, ""), ("alias", &link, "")]));
-        assert!(err.contains("same canonical root"), "{err}");
+        assert!(err.contains("same directory"), "{err}");
+    }
+
+    #[test]
+    fn accepts_absolute_root() {
+        let tmp = TempDir::new().unwrap();
+        let ws = make_dir(&tmp, "ws");
+        assert!(ws.is_absolute(), "temp roots are absolute on all targets");
+        let registry = build_ok(&config_for(&[("ws", &ws, "")]));
+        assert_eq!(registry.iter_sorted()[0].root(), ws.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn rejects_relative_root() {
+        let err = build_err("version = 1\n\n[workspaces.ws]\nroot = 'relative/project'\n");
+        assert!(err.contains("must be absolute"), "{err}");
+    }
+
+    #[test]
+    fn case_distinct_roots_follow_filesystem_case_semantics() {
+        // Create two case-distinct candidate directories and let the
+        // filesystem decide whether they are the same object: on a
+        // case-insensitive volume `Alpha`/`alpha` collide and must be
+        // rejected as duplicates; on a case-sensitive volume they are two
+        // real directories and both must register.
+        let tmp = TempDir::new().unwrap();
+        let upper = make_dir(&tmp, "Alpha");
+        let lower = tmp.path().join("alpha");
+        if lower.exists() {
+            let err = build_err(&config_for(&[("upper", &upper, ""), ("lower", &lower, "")]));
+            assert!(err.contains("same directory"), "{err}");
+        } else {
+            std::fs::create_dir(&lower).unwrap();
+            let registry = build_ok(&config_for(&[("upper", &upper, ""), ("lower", &lower, "")]));
+            assert_eq!(registry.iter_sorted().len(), 2);
+        }
+    }
+
+    #[test]
+    fn quoted_dotted_workspace_id_loads_as_one_id() {
+        let tmp = TempDir::new().unwrap();
+        let ws = make_dir(&tmp, "ws");
+        // `.` is valid inside a WorkspaceId, but TOML dotted table syntax
+        // would split an unquoted header into nested tables, so the id must
+        // be quoted.
+        let toml = format!(
+            "version = 1\n\n[workspaces.\"project.v2\"]\nroot = '{}'\n",
+            ws.display()
+        );
+        let registry = build_ok(&toml);
+        assert_eq!(registry.iter_sorted().len(), 1);
+        assert_eq!(
+            registry.iter_sorted()[0].id().unwrap().as_str(),
+            "project.v2"
+        );
+        assert!(registry
+            .get(&WorkspaceId::parse("project.v2").unwrap())
+            .is_some());
+
+        // Unquoted, the header describes a workspace literally named
+        // `project` with an unknown `v2` field — rejected strictly.
+        let unquoted = format!(
+            "version = 1\n\n[workspaces.project.v2]\nroot = '{}'\n",
+            ws.display()
+        );
+        let err = build_err(&unquoted);
+        assert!(err.contains("unknown field"), "{err}");
     }
 
     #[test]
@@ -496,16 +601,6 @@ mod tests {
             ("parent", &parent, "write = true"),
         ]));
         assert!(err.contains("is nested inside"), "{err}");
-    }
-
-    #[test]
-    fn path_contains_uses_component_semantics_not_string_prefix() {
-        let parent = Path::new("/ws/project");
-        assert!(path_contains(parent, Path::new("/ws/project/src/main.rs")));
-        assert!(path_contains(parent, Path::new("/ws/project")));
-        assert!(!path_contains(parent, Path::new("/ws/project-other")));
-        assert!(!path_contains(parent, Path::new("/ws/projectx/sub")));
-        assert!(!path_contains(parent, Path::new("/ws")));
     }
 
     #[cfg(unix)]

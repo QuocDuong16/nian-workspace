@@ -11,7 +11,7 @@ pub enum TransportChoice {
 #[command(
     name = "nian-workspace",
     version,
-    about = "A minimal, secure local MCP workspace server for AI coding clients.",
+    about = "A secure local workspace bridge for web-hosted AI clients using MCP.",
     long_about = None
 )]
 pub struct Cli {

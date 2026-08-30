@@ -97,11 +97,20 @@ allow_shell = false
 root = "/home/user/Workspace/nian-home"
 ```
 
+Registry roots must be **absolute paths**; a relative root is rejected at startup so the policy cannot depend on the directory the server was started from.
+
+Workspace IDs may contain dots (`.`). TOML dotted table syntax would split such an id into nested tables, so quote it in the header:
+
+```toml
+[workspaces."project.v2"]
+root = "/home/user/Workspace/project-v2"
+```
+
 The security properties of this configuration are fixed by design:
 
 - **Roots are explicitly operator-configured** and canonicalized once at startup; they are never chosen, switched, or supplied by MCP requests.
 - **Roots are fixed for the lifetime of the process** — the registry is immutable after startup (no runtime add/remove/reload).
-- **Roots may not overlap**: duplicate canonical roots (including symlink aliases to the same directory) and nested roots are rejected at startup in both directions, so a broader writable workspace cannot bypass a narrower read-only one.
+- **Roots may not overlap**: duplicate roots (the same directory reached through different spellings, including symlink aliases and case-variant names on case-insensitive filesystems) and nested roots are rejected at startup in both directions, so a broader writable workspace cannot bypass a narrower read-only one. Comparison uses OS filesystem identity, not path strings.
 - **Permissions are per workspace and conservative by default**: `write`, `exec`, and `allow_shell` default to `false`; read access is implicit; `allow_shell = true` requires `exec = true`.
 - **Workspace IDs are validated logical names** (`[a-z0-9][a-z0-9._-]{0,63}`) — lowercase, 1–64 characters, no path semantics, no aliases, no case folding.
 - Unknown or misspelled configuration fields are rejected rather than silently ignored.

@@ -1,4 +1,4 @@
-//! `nian-workspace` — a minimal, secure local MCP workspace server.
+//! `nian-workspace` — a secure local workspace bridge for web-hosted AI clients using MCP.
 //!
 //! stdout carries MCP protocol frames only (stdio mode); all logs go to
 //! stderr.
