@@ -16,6 +16,8 @@
 //! This logic must never be duplicated in individual tools.
 
 use crate::error::{ToolError, ToolResult};
+use crate::permissions::Permissions;
+use crate::workspace_id::WorkspaceId;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
@@ -152,6 +154,59 @@ impl Workspace {
             return Err(escape_err());
         }
         Ok(resolved)
+    }
+}
+
+/// A fully validated workspace execution context (v0.2 M1 refactor).
+///
+/// Bundles the three things every tool ultimately operates against:
+///
+/// - the logical identity (`Some` only in registry mode; single-workspace
+///   mode is anonymous), carried by [`WorkspaceId`];
+/// - the canonical root plus the hardened root-bound resolver, which remains
+///   the single authority for traversal rejection, absolute-path boundary
+///   checks, symlink-escape protection, and lazy write-target resolution;
+/// - the capability set for this workspace.
+///
+/// The context is immutable once built at startup. It deliberately adds no
+/// path logic of its own — isolation decisions stay in [`Workspace`].
+#[derive(Debug, Clone)]
+pub struct WorkspaceContext {
+    id: Option<WorkspaceId>,
+    resolver: Workspace,
+    permissions: Permissions,
+}
+
+impl WorkspaceContext {
+    /// Assemble a context from an already-opened resolver.
+    ///
+    /// Registry mode passes `Some(id)`; single-workspace mode passes `None`.
+    pub fn new(id: Option<WorkspaceId>, resolver: Workspace, permissions: Permissions) -> Self {
+        Self {
+            id,
+            resolver,
+            permissions,
+        }
+    }
+
+    /// Logical workspace id (registry mode only).
+    pub fn id(&self) -> Option<&WorkspaceId> {
+        self.id.as_ref()
+    }
+
+    /// Canonical workspace root.
+    pub fn root(&self) -> &Path {
+        self.resolver.root()
+    }
+
+    /// The root-bound path resolver — the single path-isolation authority.
+    pub fn resolver(&self) -> &Workspace {
+        &self.resolver
+    }
+
+    /// Capability set for this workspace.
+    pub fn permissions(&self) -> &Permissions {
+        &self.permissions
     }
 }
 

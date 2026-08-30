@@ -1,6 +1,7 @@
 use crate::cli::Cli;
 use crate::permissions::Permissions;
-use crate::workspace::Workspace;
+use crate::registry::WorkspaceRegistry;
+use crate::workspace::{Workspace, WorkspaceContext};
 use anyhow::{bail, Context};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -61,33 +62,71 @@ impl Default for Limits {
     }
 }
 
+/// The runtime workspace model, decided entirely at startup (v0.2 M1).
+///
+/// There is deliberately no mutable "current workspace": MCP requests cannot
+/// switch roots, and no default workspace exists in registry mode. A later
+/// milestone will dispatch tool calls through either mode explicitly; M1
+/// leaves this representation in place so that dispatch needs no redesign.
+#[derive(Debug, Clone)]
+pub enum RuntimeMode {
+    /// v0.1 behavior: one fixed canonical workspace root plus CLI permissions.
+    SingleWorkspace(Arc<WorkspaceContext>),
+    /// v0.2: an immutable registry of validated workspace contexts. Built
+    /// completely at startup; roots, ids, and permissions never change while
+    /// the process runs.
+    WorkspaceRegistry(Arc<WorkspaceRegistry>),
+}
+
 /// Central shared runtime state used by all MCP tools (spec section 15).
 #[derive(Clone)]
 pub struct AppState {
-    workspace: Arc<Workspace>,
-    permissions: Permissions,
+    mode: RuntimeMode,
     limits: Limits,
 }
 
 impl AppState {
+    /// Single-workspace state, exactly as in v0.1: an opened root plus
+    /// CLI-derived permissions.
     pub fn new(workspace: Workspace, permissions: Permissions, limits: Limits) -> Self {
         Self {
-            workspace: Arc::new(workspace),
-            permissions,
+            mode: RuntimeMode::SingleWorkspace(Arc::new(WorkspaceContext::new(
+                None,
+                workspace,
+                permissions,
+            ))),
             limits,
         }
     }
 
-    pub fn workspace(&self) -> &Workspace {
-        &self.workspace
-    }
-
-    pub fn permissions(&self) -> &Permissions {
-        &self.permissions
+    pub fn mode(&self) -> &RuntimeMode {
+        &self.mode
     }
 
     pub fn limits(&self) -> &Limits {
         &self.limits
+    }
+
+    /// The single workspace context. Only meaningful in
+    /// [`RuntimeMode::SingleWorkspace`] — registry mode stops before MCP
+    /// serving in M1, so tools can never observe a registry-mode state.
+    pub fn single_workspace(&self) -> &WorkspaceContext {
+        match &self.mode {
+            RuntimeMode::SingleWorkspace(ctx) => ctx,
+            RuntimeMode::WorkspaceRegistry(_) => {
+                unreachable!("single-workspace accessors are unavailable in registry mode")
+            }
+        }
+    }
+
+    /// The root-bound path resolver of the single workspace (v0.1 accessor).
+    pub fn workspace(&self) -> &Workspace {
+        self.single_workspace().resolver()
+    }
+
+    /// The permissions of the single workspace (v0.1 accessor).
+    pub fn permissions(&self) -> &Permissions {
+        self.single_workspace().permissions()
     }
 }
 
@@ -111,9 +150,69 @@ impl AppState {
     /// Build shared state from parsed CLI arguments, validating permission
     /// combinations and resolving the workspace root up front.
     pub fn from_cli(cli: &Cli) -> anyhow::Result<Self> {
+        cli.validate()?;
+
+        if let Some(config_path) = cli.workspace_config.as_deref() {
+            // Registry mode: permissions come from the per-workspace
+            // configuration, never from the CLI permission flags.
+            let registry = WorkspaceRegistry::from_file(config_path)?;
+            return Ok(Self {
+                mode: RuntimeMode::WorkspaceRegistry(Arc::new(registry)),
+                limits: Limits::default(),
+            });
+        }
+
         let permissions = Permissions::from_flags(cli.write, cli.exec, cli.allow_shell)?;
         let root = resolve_workspace_root(cli.workspace.as_deref())?;
         let workspace = Workspace::open(&root)?;
         Ok(Self::new(workspace, permissions, Limits::default()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace_id::WorkspaceId;
+    use tempfile::TempDir;
+
+    fn temp_workspace() -> (TempDir, Workspace) {
+        let tmp = TempDir::new().expect("tempdir");
+        let ws = Workspace::open(tmp.path()).expect("open workspace");
+        (tmp, ws)
+    }
+
+    #[test]
+    fn new_wraps_single_workspace_context_without_id() {
+        let (_tmp, ws) = temp_workspace();
+        let state = AppState::new(ws, Permissions::default(), Limits::default());
+        assert!(matches!(state.mode(), RuntimeMode::SingleWorkspace(_)));
+        assert!(state.single_workspace().id().is_none());
+        assert!(!state.permissions().write);
+    }
+
+    #[test]
+    fn registry_mode_state_carries_immutable_registry() {
+        let tmp = TempDir::new().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let config = format!(
+            "version = 1\n\n[workspaces.demo]\nroot = '{}'\n",
+            ws.display()
+        );
+        let registry = WorkspaceRegistry::from_toml_str(&config).expect("valid config");
+        let state = AppState {
+            mode: RuntimeMode::WorkspaceRegistry(Arc::new(registry)),
+            limits: Limits::default(),
+        };
+        match state.mode() {
+            RuntimeMode::WorkspaceRegistry(reg) => {
+                let ctx = reg
+                    .get(&WorkspaceId::parse("demo").unwrap())
+                    .expect("registered");
+                assert_eq!(ctx.id().unwrap().as_str(), "demo");
+                assert!(!ctx.permissions().write);
+            }
+            _ => panic!("expected registry mode"),
+        }
     }
 }
