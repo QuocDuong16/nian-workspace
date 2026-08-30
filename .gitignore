@@ -2,3 +2,4 @@
 Cargo.lock.bak
 *.tmp
 .*.nian-patch-tmp
+.env
