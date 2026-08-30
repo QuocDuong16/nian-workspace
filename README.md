@@ -142,6 +142,57 @@ Settings
 
 The same tunnel can be reused for several local projects by creating several profiles with the same tunnel ID and a different `--mcp-command` workspace path. Only **one backend should actively own a given tunnel at a time**. Stop the currently running profile before starting another profile that reuses the same tunnel. A profile switch changes which `nian-workspace` process is reachable; it does not make one process serve multiple roots.
 
+#### Long-running stdio backend: serialize concurrent MCP calls
+
+When `tunnel-client` forwards to a single long-lived `nian-workspace` stdio process, set `max_concurrent_requests` to `1` under the `mcp:` section of the profile configuration:
+
+```yaml
+mcp:
+  max_concurrent_requests: 1
+```
+
+`tunnel-client` itself supports concurrent MCP execution. However, a single `nian-workspace` stdio backend processes requests sequentially through one process, and concurrent forwarding from `tunnel-client` can cause interleaved responses or transport-level failures. Setting `max_concurrent_requests: 1` serializes MCP calls through the shared stdio backend, which has proven more reliable for long-running coding sessions.
+
+This is a **runtime interoperability recommendation** for the `tunnel-client` + stdio deployment — it is not a protocol requirement of `nian-workspace` itself.
+
+The field is added to the profile YAML under the existing `mcp:` section and must not replace the command or channel configuration:
+
+```yaml
+# ~/.config/tunnel-client/nian-workspace-my-project.yaml
+tunnel:
+  tunnel_id: "tunnel_..."
+  api_key: "${CONTROL_PLANE_API_KEY}"
+
+mcp:
+  command: "/absolute/path/to/nian-workspace"
+  args:
+    - "/absolute/path/to/my-project"
+    - "--write"
+    - "--exec"
+  max_concurrent_requests: 1
+```
+
+To set it per-run without editing the profile file, use the environment variable equivalent:
+
+```bash
+MCP_MAX_CONCURRENT_REQUESTS=1 \
+  tunnel-client run --profile nian-workspace-my-project
+```
+
+#### Troubleshooting: tunnel-client MCP tools/call failures
+
+If `tunnel-client` MCP `tools/call` requests fail with the following pattern:
+
+```json
+{
+  "status_code": 502,
+  "failure_source": "client_internal",
+  "upstream_response_received": false
+}
+```
+
+first confirm the `nian-workspace` stdio backend itself is healthy (check that the process is still running and responds to `tunnel-client doctor --profile <profile>`). If the backend is healthy and the failure recurs, the recommended first mitigation is to set `max_concurrent_requests: 1` (as described above) or pass the equivalent environment variable. This does not guarantee the issue is resolved — 502 errors with `client_internal` as the failure source can also indicate network or control-plane issues — but it is the most common fix when the failure originates from concurrent request forwarding against a single stdio backend.
+
 ### Streamable HTTP
 
 For clients that can reach the machine directly through a trusted local/private path, run the built-in loopback-only Streamable HTTP transport:
