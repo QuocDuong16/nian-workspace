@@ -1,20 +1,35 @@
 # nian-workspace
 
-A minimal, secure local MCP workspace server for AI coding clients.
+A secure local workspace bridge for web-hosted AI clients using MCP.
 
-> **What it is not:** it is not an AI agent.
->
-> The MCP client — ChatGPT, Codex, Claude Code, Cursor, or any compatible
-> client — is the agent. `nian-workspace` is only the execution and workspace
-> capability layer it operates through.
+`nian-workspace` lets a remote or web-hosted AI work with a local coding project through the Model Context Protocol — without exposing an unauthenticated public filesystem or shell service. A single process serves one local workspace root, providing file inspection, search, edits, controlled command execution, and Git access, always scoped to the configured directory.
 
-`nian-workspace` exposes one local directory (the *workspace*) to MCP clients so they can inspect files, search code, edit files, run controlled commands, and inspect Git state — always inside the configured root.
+The reference integration is **ChatGPT + Secure MCP Tunnel**, which connects a web-hosted AI client to a local workspace without requiring the machine to accept inbound network connections.
 
-Each running `nian-workspace` process serves exactly one workspace root. Start another process (or switch the process/tunnel profile) when you want to expose a different project.
-
-```bash
-nian-workspace .
+```text
+ChatGPT / web-hosted AI
+        |
+        | MCP
+        v
+ Secure MCP Tunnel
+        |
+        v
+  nian-workspace
+        |
+        +-- files / search
+        +-- patches
+        +-- commands
+        +-- Git
+        |
+        v
+  local workspace
 ```
+
+Standard MCP compatibility also allows local clients (such as Claude Code, Cursor, or Codex) to use `nian-workspace` as a direct stdio backend — see [Local stdio clients](#stdio-local-clients) — but the primary design target is bridging a local workspace to a web-hosted AI through a secure tunnel.
+
+> **What it is not:** `nian-workspace` is not an AI agent.
+> The MCP client is the agent. `nian-workspace` is the local execution and
+> workspace capability layer it operates through.
 
 ## Install
 
@@ -81,28 +96,9 @@ nian-workspace . --write --exec --allow-shell  # + shell syntax (cmd.exe / /bin/
 
 One process owns one workspace root. This is deliberate: the workspace boundary is fixed when the process starts instead of being switched by an MCP request.
 
-### stdio (recommended for local clients)
-
-Point your client's MCP config at the installed binary and choose the project root in `args`:
-
-```json
-{
-  "mcpServers": {
-    "nian-workspace": {
-      "command": "/usr/local/bin/nian-workspace",
-      "args": ["/absolute/path/to/project", "--write", "--exec"]
-    }
-  }
-}
-```
-
-Use an absolute binary path if the client does not inherit your shell `PATH`. Add `--allow-shell` only when the client genuinely needs shell syntax; `--exec` alone is safer for ordinary process execution.
-
-Logs go to stderr; the protocol runs on stdout, so stderr redirection in a wrapper script will not corrupt the session.
-
 ### ChatGPT + Secure MCP Tunnel
 
-ChatGPT connects to remote MCP servers rather than directly spawning a local stdio process. Secure MCP Tunnel can bridge a local `nian-workspace` stdio command to ChatGPT without exposing an unauthenticated HTTP listener to the public internet.
+This is the primary integration path. ChatGPT connects to remote MCP servers rather than directly spawning a local stdio process. Secure MCP Tunnel bridges a local `nian-workspace` stdio command to ChatGPT without exposing an unauthenticated HTTP listener to the public internet.
 
 Create or reuse a Secure MCP Tunnel, then create a **Restricted Runtime API Key** for `tunnel-client` with only **Tunnels: Read** and **Tunnels: Use**. Do not use an Admin API key for the daemon.
 
@@ -191,6 +187,27 @@ If `tunnel-client` MCP `tools/call` requests fail with the following pattern:
 ```
 
 first confirm the `nian-workspace` stdio backend itself is healthy (check that the process is still running and responds to `tunnel-client doctor --profile <profile>`). If the backend is healthy and the failure recurs, the recommended first mitigation is to set `max_concurrent_requests: 1` (as described above) or pass the equivalent environment variable. This does not guarantee the issue is resolved. If failures continue, inspect the `tunnel-client` and `nian-workspace` logs for additional diagnostics.
+
+### stdio (local clients)
+
+Any MCP-compatible local client can use `nian-workspace` as a direct stdio backend. This is supported and useful, but it is a secondary use case — the primary design target is the web-hosted AI + Secure MCP Tunnel path described above.
+
+Point your client's MCP config at the installed binary and choose the project root in `args`:
+
+```json
+{
+  "mcpServers": {
+    "nian-workspace": {
+      "command": "/usr/local/bin/nian-workspace",
+      "args": ["/absolute/path/to/project", "--write", "--exec"]
+    }
+  }
+}
+```
+
+Use an absolute binary path if the client does not inherit your shell `PATH`. Add `--allow-shell` only when the client genuinely needs shell syntax; `--exec` alone is safer for ordinary process execution.
+
+Logs go to stderr; the protocol runs on stdout, so stderr redirection in a wrapper script will not corrupt the session.
 
 ### Streamable HTTP
 
