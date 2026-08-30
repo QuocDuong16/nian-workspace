@@ -25,7 +25,7 @@ ChatGPT / web-hosted AI
   local workspace
 ```
 
-Standard MCP compatibility also allows local clients (such as Claude Code, Cursor, or Codex) to use `nian-workspace` as a direct stdio backend — see [Local stdio clients](#stdio-local-clients) — but the primary design target is bridging a local workspace to a web-hosted AI through a secure tunnel.
+Standard MCP compatibility also allows compatible local MCP clients to use `nian-workspace` as a direct stdio backend — see [Local MCP clients (stdio)](#local-mcp-clients-stdio) — but the primary design target is bridging a local workspace to a web-hosted AI through a secure tunnel.
 
 > **What it is not:** `nian-workspace` is not an AI agent.
 > The MCP client is the agent. `nian-workspace` is the local execution and
@@ -188,7 +188,7 @@ If `tunnel-client` MCP `tools/call` requests fail with the following pattern:
 
 first confirm the `nian-workspace` stdio backend itself is healthy (check that the process is still running and responds to `tunnel-client doctor --profile <profile>`). If the backend is healthy and the failure recurs, the recommended first mitigation is to set `max_concurrent_requests: 1` (as described above) or pass the equivalent environment variable. This does not guarantee the issue is resolved. If failures continue, inspect the `tunnel-client` and `nian-workspace` logs for additional diagnostics.
 
-### stdio (local clients)
+### Local MCP clients (stdio)
 
 Any MCP-compatible local client can use `nian-workspace` as a direct stdio backend. This is supported and useful, but it is a secondary use case — the primary design target is the web-hosted AI + Secure MCP Tunnel path described above.
 
