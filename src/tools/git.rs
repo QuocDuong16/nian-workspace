@@ -319,13 +319,26 @@ fn redact_display_variants(text: &str, canonical_roots: &[&str], replacement: &s
 /// itself, its verbatim-prefix-stripped form (`\\?\C:\…` is what Rust's
 /// canonicalization produces on Windows), and the separator-swapped twin of
 /// each — Git prints forward slashes on Windows where Rust stores
-/// backslashes. Deduplicated and ordered deterministically; on Unix the
-/// backslash twins simply never match anything. Used only for disclosure
-/// prevention, never for path decisions.
+/// backslashes. A verbatim UNC root (`\\?\UNC\server\share\…`) additionally
+/// derives the ordinary UNC spellings `\\server\share\…` and
+/// `//server/share/…`, because a bare `UNC\…` strip is not how clients or
+/// Git spell UNC paths. Deduplicated and ordered deterministically; on Unix
+/// the backslash twins simply never match anything. Used only for disclosure
+/// prevention in client-visible diagnostics — never for path authorization,
+/// containment, filesystem identity, workspace lookup, or resolution, which
+/// remain exclusively in the workspace resolver and registry validation.
 fn path_display_variants(canonical: &str) -> Vec<String> {
     let mut forms: Vec<String> = vec![canonical.to_string()];
     if let Some(stripped) = canonical.strip_prefix(r"\\?\") {
         forms.push(stripped.to_string());
+        // Verbatim UNC device path: the ordinary spellings put the `\\`
+        // (or `//`) share prefix where the verbatim form says `UNC`.
+        if let Some(rest) = stripped
+            .strip_prefix("UNC\\")
+            .or_else(|| stripped.strip_prefix("UNC/"))
+        {
+            forms.push(format!(r"\\{rest}"));
+        }
     }
     let mut variants: Vec<String> = Vec::new();
     for form in &forms {
@@ -1470,5 +1483,83 @@ mod tests {
         // matches anything and is harmless).
         let unix = path_display_variants("/home/user/project");
         assert!(unix.contains(&"/home/user/project".to_string()), "{unix:?}");
+    }
+
+    // -- verbatim UNC roots (v0.2 M4 final remediation) -----------------------
+    //
+    // Pure string-level tests: a verbatim UNC root (\\?\UNC\server\share\…,
+    // what Rust's canonicalize() produces for a UNC workspace root on
+    // Windows) must also redact the ordinary UNC spellings Git and clients
+    // actually print.
+
+    #[test]
+    fn path_display_variants_derive_ordinary_unc_spellings() {
+        let variants = path_display_variants(r"\\?\UNC\server\share\alpha");
+        for expected in [
+            r"\\?\UNC\server\share\alpha",
+            r"\\server\share\alpha",
+            "//server/share/alpha",
+        ] {
+            assert!(
+                variants.contains(&expected.to_string()),
+                "missing '{expected}' in {variants:?}"
+            );
+        }
+        let unique: std::collections::HashSet<&String> = variants.iter().collect();
+        assert_eq!(unique.len(), variants.len(), "no duplicates: {variants:?}");
+
+        // Drive-style verbatim paths must not grow UNC forms.
+        let drive = path_display_variants(r"\\?\C:\repo\alpha");
+        assert!(
+            !drive
+                .iter()
+                .any(|v| v.starts_with(r"\\") && !v.starts_with(r"\\?\")),
+            "drive path must not derive UNC spellings: {drive:?}"
+        );
+    }
+
+    #[test]
+    fn redaction_covers_the_ordinary_backslash_unc_spelling() {
+        let redacted = redact_display_variants(
+            r"fatal: cannot open '\\server\share\alpha\file.txt'",
+            &[r"\\?\UNC\server\share\alpha"],
+            ".",
+        );
+        // The ordinary UNC root is gone and the useful suffix remains.
+        assert_eq!(redacted, r"fatal: cannot open '.\file.txt'");
+    }
+
+    #[test]
+    fn redaction_covers_the_forward_slash_unc_git_spelling() {
+        let redacted = redact_display_variants(
+            "fatal: cannot open '//server/share/alpha/file.txt'",
+            &[r"\\?\UNC\server\share\alpha"],
+            ".",
+        );
+        assert_eq!(redacted, "fatal: cannot open './file.txt'");
+    }
+
+    #[test]
+    fn redaction_covers_the_verbatim_unc_form_itself() {
+        let redacted = redact_display_variants(
+            r"fatal: cannot open '\\?\UNC\server\share\alpha\file.txt'",
+            &[r"\\?\UNC\server\share\alpha"],
+            ".",
+        );
+        assert_eq!(redacted, r"fatal: cannot open '.\file.txt'");
+    }
+
+    #[test]
+    fn redaction_never_rewrites_a_unc_prefix_collision_sibling() {
+        for sibling in [
+            r"fatal: cannot open '\\server\share\alpha-other\file.txt'",
+            "fatal: cannot open '//server/share/alpha-other/file.txt'",
+        ] {
+            let redacted = redact_display_variants(sibling, &[r"\\?\UNC\server\share\alpha"], ".");
+            assert_eq!(
+                redacted, sibling,
+                "UNC prefix collision must not be rewritten"
+            );
+        }
     }
 }
