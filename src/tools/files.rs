@@ -10,7 +10,7 @@ use crate::config::{AppState, Limits};
 use crate::error::{ToolError, ToolResult};
 use crate::tools::discovery::{resolve_registry_workspace, with_workspace_provenance};
 use crate::tools::{clip_line, is_generated_or_vcs_dir};
-use crate::workspace::WorkspaceContext;
+use crate::workspace::{PathPresentation, WorkspaceContext};
 use crate::workspace_id::WorkspaceId;
 use rmcp::schemars;
 use serde_json::json;
@@ -63,16 +63,24 @@ pub struct RegistryListFilesArgs {
     pub args: ListFilesArgs,
 }
 
-/// Single-workspace mode entry point (v0.1 behavior, unchanged).
+/// Single-workspace mode entry point: v0.1 behavior and v0.1 path
+/// presentation (the workspace root renders as its canonical absolute path).
 pub(crate) fn list_files(state: &AppState, args: ListFilesArgs) -> ToolResult<serde_json::Value> {
-    list_files_for_context(state.single_workspace(), state.limits(), args)
+    list_files_for_context(
+        state.single_workspace(),
+        state.limits(),
+        PathPresentation::SingleCompatible,
+        args,
+    )
 }
 
 /// Context-based core shared by both server modes. All filesystem behavior
-/// goes through the context's hardened resolver; `limits` bounds the output.
+/// goes through the context's hardened resolver; `limits` bounds the output
+/// and `presentation` decides how client-visible paths are rendered.
 pub(crate) fn list_files_for_context(
     ctx: &WorkspaceContext,
     limits: &Limits,
+    presentation: PathPresentation,
     args: ListFilesArgs,
 ) -> ToolResult<serde_json::Value> {
     let ws = ctx.resolver();
@@ -81,13 +89,13 @@ pub(crate) fn list_files_for_context(
     if !dir.exists() {
         return Err(ToolError::msg(format!(
             "Path does not exist: {}",
-            ws.display_relative(&dir)
+            ws.display_relative_as(&dir, presentation)
         )));
     }
     if !dir.is_dir() {
         return Err(ToolError::msg(format!(
             "'{}' is not a directory.",
-            ws.display_relative(&dir)
+            ws.display_relative_as(&dir, presentation)
         )));
     }
 
@@ -122,7 +130,7 @@ pub(crate) fn list_files_for_context(
                 continue;
             }
         };
-        let rel = ws.display_relative(entry.path());
+        let rel = ws.display_relative_as(entry.path(), presentation);
         let file_type = entry.file_type();
         let kind = if file_type.is_symlink() {
             "symlink"
@@ -164,7 +172,7 @@ pub(crate) fn list_files_for_context(
     }
 
     Ok(json!({
-        "root": ws.display_relative(&dir),
+        "root": ws.display_relative_as(&dir, presentation),
         "depth": depth,
         "count": entries.len(),
         "truncated": truncated,
@@ -180,7 +188,12 @@ pub(crate) fn registry_list_files(
 ) -> ToolResult<serde_json::Value> {
     let RegistryListFilesArgs { workspace, args } = args;
     let ctx = resolve_registry_workspace(state, &workspace)?;
-    let value = list_files_for_context(&ctx, state.limits(), args)?;
+    let value = list_files_for_context(
+        &ctx,
+        state.limits(),
+        PathPresentation::RegistryRelative,
+        args,
+    )?;
     Ok(with_workspace_provenance(value, &workspace))
 }
 
@@ -241,35 +254,49 @@ pub struct RegistryReadFileArgs {
     pub args: ReadFileArgs,
 }
 
-/// Single-workspace mode entry point (v0.1 behavior, unchanged).
+/// Single-workspace mode entry point: v0.1 behavior and v0.1 path
+/// presentation (the workspace root renders as its canonical absolute path).
 pub(crate) fn read_file(state: &AppState, args: ReadFileArgs) -> ToolResult<serde_json::Value> {
-    read_file_for_context(state.single_workspace(), state.limits(), args)
+    read_file_for_context(
+        state.single_workspace(),
+        state.limits(),
+        PathPresentation::SingleCompatible,
+        args,
+    )
 }
 
 /// Context-based core shared by both server modes: identical UTF-8/binary,
 /// line-number, range, and bounded-memory behavior, rooted at the selected
-/// context's hardened resolver.
+/// context's hardened resolver. `presentation` governs client-visible path
+/// rendering, including inside error messages.
 pub(crate) fn read_file_for_context(
     ctx: &WorkspaceContext,
     limits: &Limits,
+    presentation: PathPresentation,
     args: ReadFileArgs,
 ) -> ToolResult<serde_json::Value> {
     let ws = ctx.resolver();
 
     let path: PathBuf = ws.resolve(Some(args.path.as_str()))?;
     let meta = std::fs::metadata(&path).map_err(|e| {
-        ToolError::msg(format!("Cannot read '{}': {e}", ws.display_relative(&path)))
+        ToolError::msg(format!(
+            "Cannot read '{}': {e}",
+            ws.display_relative_as(&path, presentation)
+        ))
     })?;
     if meta.is_dir() {
         return Err(ToolError::msg(format!(
             "'{}' is a directory; use list_files instead.",
-            ws.display_relative(&path)
+            ws.display_relative_as(&path, presentation)
         )));
     }
 
     const BINARY_SNIFF_BYTES: usize = 8 * 1024;
     let mut reader = std::io::BufReader::new(std::fs::File::open(&path).map_err(|e| {
-        ToolError::msg(format!("Cannot open '{}': {e}", ws.display_relative(&path)))
+        ToolError::msg(format!(
+            "Cannot open '{}': {e}",
+            ws.display_relative_as(&path, presentation)
+        ))
     })?);
 
     // Binary sniff on the leading bytes.
@@ -278,7 +305,7 @@ pub(crate) fn read_file_for_context(
     if sniff[..sniff_len].contains(&0u8) {
         return Err(ToolError::msg(format!(
             "'{}' appears to be a binary file and was not read.",
-            ws.display_relative(&path)
+            ws.display_relative_as(&path, presentation)
         )));
     }
     reader.seek(SeekFrom::Start(0))?;
@@ -380,7 +407,7 @@ pub(crate) fn read_file_for_context(
 
     let last_returned = lines.last().map(|l| l.number).unwrap_or(0);
     Ok(json!({
-        "path": ws.display_relative(&path),
+        "path": ws.display_relative_as(&path, presentation),
         "start_line": lines.first().map(|l| l.number),
         "end_line": if lines.is_empty() { None } else { Some(last_returned) },
         "line_count": lines.len(),
@@ -404,7 +431,12 @@ pub(crate) fn registry_read_file(
 ) -> ToolResult<serde_json::Value> {
     let RegistryReadFileArgs { workspace, args } = args;
     let ctx = resolve_registry_workspace(state, &workspace)?;
-    let value = read_file_for_context(&ctx, state.limits(), args)?;
+    let value = read_file_for_context(
+        &ctx,
+        state.limits(),
+        PathPresentation::RegistryRelative,
+        args,
+    )?;
     Ok(with_workspace_provenance(value, &workspace))
 }
 
@@ -969,5 +1001,88 @@ mod tests {
                 .contains("Unknown workspace 'does-not-exist'"),
             "{err}"
         );
+    }
+
+    // -- path presentation contracts (v0.2 M3 remediation) -------------------
+
+    #[test]
+    fn single_read_file_root_error_keeps_v01_absolute_presentation() {
+        let (tmp, state) = fixture(b"x\n");
+        let root = tmp.path().canonicalize().unwrap();
+        let err = read_file(
+            &state,
+            ReadFileArgs {
+                path: ".".into(),
+                start_line: None,
+                end_line: None,
+            },
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("is a directory"), "{text}");
+        assert!(
+            text.contains(root.to_string_lossy().as_ref()),
+            "v0.1 presentation keeps the canonical root in single mode: {text}"
+        );
+    }
+
+    #[test]
+    fn single_list_files_root_field_keeps_v01_absolute_presentation() {
+        let (tmp, state) = fixture(b"x\n");
+        let root = tmp.path().canonicalize().unwrap();
+        let out = list_files(
+            &state,
+            ListFilesArgs {
+                path: None,
+                depth: None,
+                include_hidden: false,
+                glob: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(out["root"], json!(root.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn registry_read_file_root_error_presents_dot_without_disclosure() {
+        let (tmp, state) = registry_fixture();
+        let alpha_abs = tmp.path().join("alpha").canonicalize().unwrap();
+        let err = registry_read_file(
+            &state,
+            RegistryReadFileArgs {
+                workspace: reg_id("alpha"),
+                args: ReadFileArgs {
+                    path: ".".into(),
+                    start_line: None,
+                    end_line: None,
+                },
+            },
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("'.' is a directory"), "{text}");
+        assert!(
+            !text.contains(alpha_abs.to_string_lossy().as_ref()),
+            "registry errors must not expose the canonical root: {text}"
+        );
+    }
+
+    #[test]
+    fn registry_list_files_root_presents_dot() {
+        let (_tmp, state) = registry_fixture();
+        let out = registry_list_files(
+            &state,
+            RegistryListFilesArgs {
+                workspace: reg_id("alpha"),
+                args: ListFilesArgs {
+                    path: None,
+                    depth: None,
+                    include_hidden: false,
+                    glob: None,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(out["root"], json!("."));
     }
 }

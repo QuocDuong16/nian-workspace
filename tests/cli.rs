@@ -1,6 +1,7 @@
 //! End-to-end CLI tests: v0.1 single-workspace behavior must remain intact,
 //! and the v0.2 `--workspace-config` registry mode must expose exactly its
-//! mode-specific MCP tool surface (M2: discovery only).
+//! mode-specific MCP tool surface (M3: discovery + read-only filesystem
+//! tools, each selecting one workspace by logical WorkspaceId).
 //!
 //! Both modes are verified by driving a real MCP stdio session:
 //! initialize, tools/list, and tools/call exchanges against the actual
@@ -393,6 +394,109 @@ fn single_mode_tools_list_is_exactly_the_v01_surface() {
         stderr.contains("starting nian-workspace over stdio"),
         "{stderr}"
     );
+}
+
+#[test]
+fn single_mode_root_paths_follow_the_v01_contract() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("note.txt"), b"v01 marker\n").unwrap();
+    // The server canonicalizes the positional root exactly like this, so
+    // this is the byte-exact string v0.1 clients saw before M3.
+    let root = tmp
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let mut session = McpSession::start(&[tmp.path().to_str().unwrap()]);
+    session.initialize();
+
+    // list_files at the workspace root: `root` is the canonical absolute
+    // root, not "." — the pre-M3 v0.1 presentation contract.
+    let response = session.call_tool(3, "list_files", serde_json::json!({}));
+    assert!(response.get("error").is_none(), "{response}");
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["root"], serde_json::json!(root), "{content}");
+
+    // search without `path`: `path` is the canonical absolute root too.
+    let response = session.call_tool(4, "search", serde_json::json!({ "query": "v01 marker" }));
+    assert!(response.get("error").is_none(), "{response}");
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["path"], serde_json::json!(root), "{content}");
+
+    let (code, stderr) = session.shutdown();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+}
+
+#[test]
+fn registry_root_requests_present_as_dot_without_disclosure() {
+    let (tmp, cfg) = cross_workspace_registry();
+    let alpha_str = tmp.path().join("alpha").to_string_lossy().into_owned();
+    let alpha_trimmed = alpha_str.trim_start_matches('/').to_string();
+    let cfg_str = cfg.to_string_lossy().into_owned();
+    let mut session = McpSession::start(&["--workspace-config", cfg.to_str().unwrap()]);
+    session.initialize();
+
+    // list_files at the selected root: root == "." — never the absolute
+    // alpha root, anywhere in the response.
+    let response = session.call_tool(3, "list_files", serde_json::json!({ "workspace": "alpha" }));
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["root"], serde_json::json!("."), "{content}");
+    let raw = response.to_string();
+    assert!(
+        !raw.contains(alpha_str.as_str()) && !raw.contains(alpha_trimmed.as_str()),
+        "list_files must not expose the canonical root: {raw}"
+    );
+
+    // search at the selected root: path == ".".
+    let response = session.call_tool(
+        4,
+        "search",
+        serde_json::json!({ "workspace": "alpha", "query": "UNIQUE_" }),
+    );
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["path"], serde_json::json!("."), "{content}");
+    let raw = response.to_string();
+    assert!(
+        !raw.contains(alpha_str.as_str()) && !raw.contains(alpha_trimmed.as_str()),
+        "search must not expose the canonical root: {raw}"
+    );
+
+    // read_file at the selected root: the normal "is a directory" failure,
+    // with neither the absolute root nor the registry config path in the
+    // error text.
+    let response = session.call_tool(
+        5,
+        "read_file",
+        serde_json::json!({ "workspace": "alpha", "path": "." }),
+    );
+    let text = expect_tool_error(&response);
+    assert!(text.contains("is a directory"), "{text}");
+    assert!(
+        !text.contains(alpha_str.as_str()) && !text.contains(alpha_trimmed.as_str()),
+        "read_file error must not expose the canonical root: {text}"
+    );
+    assert!(
+        !text.contains(cfg_str.as_str()),
+        "error must not expose the registry config path: {text}"
+    );
+
+    // The server remains fully usable afterwards.
+    let response = session.call_tool(6, "list_workspaces", serde_json::json!({}));
+    assert!(response.get("error").is_none(), "{response}");
+    let response = session.call_tool(
+        7,
+        "read_file",
+        serde_json::json!({ "workspace": "alpha", "path": "shared.txt" }),
+    );
+    assert_eq!(
+        response["result"]["structuredContent"]["lines"][0],
+        serde_json::json!("1: FROM_ALPHA")
+    );
+
+    let (code, stderr) = session.shutdown();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(!stderr.contains("panic"), "{stderr}");
 }
 
 #[test]

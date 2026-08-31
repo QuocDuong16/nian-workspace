@@ -10,7 +10,7 @@ use crate::config::{AppState, Limits};
 use crate::error::{ToolError, ToolResult};
 use crate::tools::discovery::{resolve_registry_workspace, with_workspace_provenance};
 use crate::tools::{is_generated_dir, is_vcs_metadata_dir};
-use crate::workspace::WorkspaceContext;
+use crate::workspace::{PathPresentation, WorkspaceContext};
 use crate::workspace_id::WorkspaceId;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
@@ -146,17 +146,25 @@ pub struct RegistrySearchArgs {
     pub args: SearchArgs,
 }
 
-/// Single-workspace mode entry point (v0.1 behavior, unchanged).
+/// Single-workspace mode entry point: v0.1 behavior and v0.1 path
+/// presentation (the workspace root renders as its canonical absolute path).
 pub(crate) fn handle(state: &AppState, args: SearchArgs) -> ToolResult<serde_json::Value> {
-    search_for_context(state.single_workspace(), state.limits(), args)
+    search_for_context(
+        state.single_workspace(),
+        state.limits(),
+        PathPresentation::SingleCompatible,
+        args,
+    )
 }
 
 /// Context-based core shared by both server modes: identical matcher,
 /// visibility, bounding, and workspace-relative path behavior, rooted at
-/// the selected context's hardened resolver.
+/// the selected context's hardened resolver. `presentation` governs
+/// client-visible path rendering, including inside error messages.
 pub(crate) fn search_for_context(
     ctx: &WorkspaceContext,
     limits: &Limits,
+    presentation: PathPresentation,
     args: SearchArgs,
 ) -> ToolResult<serde_json::Value> {
     let ws = ctx.resolver();
@@ -231,7 +239,7 @@ pub(crate) fn search_for_context(
     if !target.exists() {
         return Err(ToolError::msg(format!(
             "Search path does not exist: {}",
-            ws.display_relative(&target)
+            ws.display_relative_as(&target, presentation)
         )));
     }
 
@@ -271,7 +279,7 @@ pub(crate) fn search_for_context(
             continue;
         }
         if let Some(glob) = &glob_set {
-            let rel = ws.display_relative(entry.path());
+            let rel = ws.display_relative_as(entry.path(), presentation);
             if !(glob.is_match(&rel)
                 || entry
                     .file_name()
@@ -284,7 +292,7 @@ pub(crate) fn search_for_context(
         files_searched += 1;
 
         let path_buf = PathBuf::from(entry.path());
-        let rel_file_path = ws.display_relative(&path_buf);
+        let rel_file_path = ws.display_relative_as(&path_buf, presentation);
         let mut hit_limit = false;
         let sink = CollectingSink {
             file_path: rel_file_path,
@@ -310,7 +318,7 @@ pub(crate) fn search_for_context(
         }
     }
 
-    let rel_target = ws.display_relative(&target);
+    let rel_target = ws.display_relative_as(&target, presentation);
     Ok(json!({
         "query": args.query,
         "path": rel_target,
@@ -329,7 +337,12 @@ pub(crate) fn registry_search(
 ) -> ToolResult<serde_json::Value> {
     let RegistrySearchArgs { workspace, args } = args;
     let ctx = resolve_registry_workspace(state, &workspace)?;
-    let value = search_for_context(&ctx, state.limits(), args)?;
+    let value = search_for_context(
+        &ctx,
+        state.limits(),
+        PathPresentation::RegistryRelative,
+        args,
+    )?;
     Ok(with_workspace_provenance(value, &workspace))
 }
 
@@ -705,6 +718,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn single_search_at_root_reports_canonical_root_path() {
+        // v0.1 single-workspace presentation: a root-targeted search echoes
+        // the canonical workspace root in `path`, exactly as before M3.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "v01_marker\n").unwrap();
+        let st = state(tmp.path());
+        let out = handle(&st, args("v01_marker")).unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        assert_eq!(
+            out["path"],
+            json!(root.to_string_lossy().as_ref()),
+            "single-mode search must keep the v0.1 root presentation: {out}"
+        );
+    }
+
     // -- registry-mode wrapper (v0.2 M3) --------------------------------------
 
     /// Two-workspace registry with distinct marker tokens per workspace.
@@ -748,6 +777,9 @@ mod tests {
             )
             .unwrap();
             assert_eq!(out["workspace"], json!(name), "logical provenance");
+            // Root-targeted search presents the selected root as "." — the
+            // canonical absolute root must never be exposed.
+            assert_eq!(out["path"], json!("."), "{out}");
             assert_eq!(out["match_count"], json!(1));
             assert_eq!(out["matches"][0]["path"], json!(expected_path));
             let rendered = out.to_string();

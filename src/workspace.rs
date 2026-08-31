@@ -21,6 +21,24 @@ use crate::workspace_id::WorkspaceId;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
+/// Client-facing presentation contract for workspace-relative paths
+/// (v0.2 M3 remediation).
+///
+/// Presentation is deliberately separate from path **resolution**: the
+/// hardened resolver decides what a request may touch, and this enum only
+/// decides how an already-resolved path is rendered to the MCP client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathPresentation {
+    /// v0.1 single-workspace contract, byte-for-byte: paths below the root
+    /// are workspace-relative; the workspace root itself renders as its
+    /// canonical absolute path, exactly as it did before M3.
+    SingleCompatible,
+    /// v0.2 registry contract: paths below the selected workspace root are
+    /// workspace-relative; the root itself renders as `"."`, and canonical
+    /// absolute roots are never exposed in responses or errors.
+    RegistryRelative,
+}
+
 #[derive(Debug, Clone)]
 pub struct Workspace {
     root_canonical: PathBuf,
@@ -47,15 +65,38 @@ impl Workspace {
             .unwrap_or_else(|| self.root_canonical.to_string_lossy().into_owned())
     }
 
-    /// Render `path` relative to the workspace root for display purposes.
+    /// Render `path` relative to the workspace root for display purposes,
+    /// using the v0.1 single-workspace presentation contract.
     ///
-    /// The workspace root itself renders as `"."` so that responses rooted
-    /// at the workspace carry a workspace-relative path instead of leaking
-    /// the absolute root (registry-mode clients must never see it).
+    /// Preserved exactly as before M3: paths below the root are
+    /// workspace-relative, and the workspace root itself renders as its
+    /// canonical absolute path. Registry-mode callers must use
+    /// [`Self::display_relative_as`] with [`PathPresentation::RegistryRelative`]
+    /// instead, so canonical roots are never exposed to registry clients.
     pub fn display_relative(&self, path: &Path) -> String {
+        self.display_relative_as(path, PathPresentation::SingleCompatible)
+    }
+
+    /// Render `path` for client-facing output under the given presentation
+    /// contract.
+    ///
+    /// Path **isolation** lives entirely in [`Self::resolve`]; this function
+    /// only decides how an already-resolved path is *presented*:
+    ///
+    /// - [`PathPresentation::SingleCompatible`]: v0.1 behavior, unchanged —
+    ///   the workspace root renders as its canonical absolute path;
+    /// - [`PathPresentation::RegistryRelative`]: v0.2 registry contract —
+    ///   the selected root renders as `"."`, so canonical roots never
+    ///   appear in registry responses or errors.
+    pub fn display_relative_as(&self, path: &Path, presentation: PathPresentation) -> String {
         match path.strip_prefix(&self.root_canonical) {
             Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().into_owned(),
-            Ok(_) => ".".to_string(),
+            Ok(_) => match presentation {
+                PathPresentation::SingleCompatible => {
+                    self.root_canonical.to_string_lossy().into_owned()
+                }
+                PathPresentation::RegistryRelative => ".".to_string(),
+            },
             _ => path.to_string_lossy().into_owned(),
         }
     }
@@ -462,11 +503,30 @@ mod tests {
     }
 
     #[test]
-    fn display_relative_renders_the_workspace_root_as_dot() {
+    fn display_relative_presentation_follows_the_mode_contract() {
         let (_tmp, ws) = make_workspace(&["src/main.rs"]);
-        // The workspace root must never be rendered as an absolute path:
-        // registry-mode responses are rooted at it.
-        assert_eq!(ws.display_relative(ws.root()), ".");
-        assert_eq!(ws.display_relative(&ws.root().join("src")), "src");
+        let root = ws.root();
+
+        // Single-workspace contract (pre-M3 v0.1): the root renders as its
+        // canonical absolute path; children stay workspace-relative.
+        assert_eq!(ws.display_relative(root), root.to_string_lossy().as_ref());
+        assert_eq!(
+            ws.display_relative_as(root, PathPresentation::SingleCompatible),
+            root.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            ws.display_relative(&root.join("src/main.rs")),
+            "src/main.rs"
+        );
+
+        // Registry contract: the root renders as "." — never an absolute path.
+        assert_eq!(
+            ws.display_relative_as(root, PathPresentation::RegistryRelative),
+            "."
+        );
+        assert_eq!(
+            ws.display_relative_as(&root.join("src"), PathPresentation::RegistryRelative),
+            "src"
+        );
     }
 }
