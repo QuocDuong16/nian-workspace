@@ -50,7 +50,7 @@ cargo build --release --locked
 # Windows:     target/release/nian-workspace.exe
 ```
 
-Tagged releases also publish checksummed archives for the platforms the current Forgejo runner can genuinely link. See [Platform support and CI honesty](#platform-support-and-ci-honesty) for the distinction between native, cross-compiled, and compile-only targets.
+Tagged releases also publish checksummed archives; release-time artifact coverage is a separate concern from the development CI gates (see [Platform support and CI honesty](#platform-support-and-ci-honesty) for the distinction between native, cross-compiled, and compile-only targets).
 
 ## Usage
 
@@ -160,8 +160,8 @@ The tool surface is mode-specific: single-workspace mode (a positional `WORKSPAC
 | `search` | ✔ | Regex or literal, capped results, every match carries its workspace-relative path. `.git`/`.hg`/`.svn` are never searched — not even through symlink aliases. Hidden and generated dirs are searched only when the requested path itself enters that territory (e.g. `path=".config"`, `path="node_modules"`); rooting at `src` does not unlock `src/.hidden` or `src/node_modules`. |
 | `git_status` | ✔ | `git status --short --branch` equivalent, paths relative to the workspace root |
 | `git_diff` | ✔ | Unstaged or staged diff, optional path filter, bounded; paths relative to the workspace root so output feeds `apply_patch` directly, even for workspaces nested inside a larger repository |
-| `apply_patch` | ✗ needs `--write` | Unified diff (`diff -u` / `git diff`). All hunks are validated before mutation, and each individual file replacement is atomic; an unexpected filesystem failure during the commit phase may leave a multi-file patch partially applied. New-file creation via `/dev/null` headers; renames/deletions rejected. Preserves existing newline style (LF/CRLF) and POSIX permission bits. |
-| `run_command` | ✗ needs `--exec` | Direct process execution (`program` + `args`), no shell interpolation. Optional `shell:true` requests need `--allow-shell`. `timeout_seconds` bounds the direct command process; expiry terminates the whole process tree (Unix and Windows). stdout/stderr are capped, output emitted before the timeout is preserved up to the caps, and a descendant holding the pipes after a successful exit can neither fake a timeout nor block the result. |
+| `apply_patch` | ✗ — single mode: `--write`; registry mode: `write = true` | Unified diff (`diff -u` / `git diff`). All hunks are validated before mutation, and each individual file replacement is atomic; an unexpected filesystem failure during the commit phase may leave a multi-file patch partially applied. New-file creation via `/dev/null` headers; renames/deletions rejected. Preserves existing newline style (LF/CRLF) and POSIX permission bits. |
+| `run_command` | ✗ — single mode: `--exec`; registry mode: `exec = true`; `shell:true` additionally needs the shell capability (`--allow-shell` in single mode, `allow_shell = true` in registry mode) | Direct process execution (`program` + `args`), no shell interpolation. `timeout_seconds` bounds the direct command process; expiry terminates the whole process tree (Unix and Windows). stdout/stderr are capped, output emitted before the timeout is preserved up to the caps, and a descendant holding the pipes after a successful exit can neither fake a timeout nor block the result. |
 
 ## Client setup
 
@@ -207,7 +207,23 @@ Settings
   → Authentication: None
 ```
 
-The same tunnel can be reused for several local projects by creating several profiles with the same tunnel ID and a different `--mcp-command` workspace path. Only **one backend should actively own a given tunnel at a time**. Stop the currently running profile before starting another profile that reuses the same tunnel. A profile switch changes which `nian-workspace` process is reachable; it does not make one process serve multiple roots.
+#### Choosing the tunnel backend: single workspace or workspace registry
+
+Only **one backend should actively own a given tunnel at a time**. Stop the currently running profile before starting another profile that reuses the same tunnel — a profile switch changes which `nian-workspace` process is reachable. The active backend itself can take either of two forms.
+
+**Single workspace** (one project per process). The `tunnel-client init` example above is exactly this form: `--mcp-command` points at one fixed workspace root, and the process serves that root for the lifetime of the profile. To work on several projects this way, create several profiles with the same tunnel ID and a different `--mcp-command` workspace path, and run them one at a time.
+
+**Workspace registry** (several fixed workspaces in one process). A v0.2 registry profile gives ChatGPT a single MCP backend that serves every operator-configured workspace at once: `list_workspaces` discovers the configured logical workspace IDs, and each tool call selects one of them. The stdio command is the registry form of the server:
+
+```bash
+tunnel-client init \
+  --sample sample_mcp_stdio_local \
+  --profile nian-workspace-my-projects \
+  --tunnel-id "$CONTROL_PLANE_TUNNEL_ID" \
+  --mcp-command "/absolute/path/to/nian-workspace --workspace-config /absolute/path/to/workspaces.toml"
+```
+
+No permission flags are passed in this form: mutation and execution capabilities come from each workspace's own `write`/`exec`/`allow_shell` configuration (see [Workspace registry configuration (v0.2)](#workspace-registry-configuration-v02)), and the workspace set is fixed at startup. MCP requests select among the configured logical workspace IDs and never supply filesystem roots; there is no runtime workspace switching or registration.
 
 #### Long-running stdio backend: serialize concurrent MCP calls
 
@@ -335,7 +351,9 @@ The current Forgejo runner is an x86_64 Linux Docker runner. Release coverage is
 | macOS x86_64 (`x86_64-apple-darwin`) | Cross-target `cargo check` only | No | Linking requires an Apple SDK/toolchain or a native macOS runner. |
 | macOS arm64 (`aarch64-apple-darwin`) | Cross-target `cargo check` only | No | Linking requires an Apple SDK/toolchain or a native macOS runner. |
 
-The release workflow publishes `nian-workspace-vX.Y.Z-<target>` archives plus a `SHA256SUMS` file. The existing quality workflow continues to compile-check Windows MSVC, both macOS targets, and Linux ARM64 exactly as compile-only targets. Native Windows/macOS release binaries should be added only after corresponding native runners (or a properly licensed SDK/toolchain) exist.
+The existing Forgejo release workflow publishes `nian-workspace-vX.Y.Z-<target>` archives plus a `SHA256SUMS` file for the targets it can genuinely link today. The quality workflow compile-checks Windows MSVC, both macOS targets, and Linux ARM64 — that is compile validation, not native runtime validation; nothing in CI executes a foreign-target binary. Native Windows/macOS runtime validation and native release artifacts require native runners, which the current CI setup does not provide.
+
+Release artifact coverage is handled separately at release time and is not permanently tied to the Forgejo runner set. When the project prepares a multi-platform release, native release artifacts are planned to be built by tag-triggered GitHub Actions workflows, so GitHub-hosted Windows/macOS/Linux runners are consumed only at release time — not on every development push. That workflow does not exist yet; designing it is part of later release preparation. Normal development CI (pushes and pull requests) remains on Forgejo Actions/DinD with the strategy described above, and no fake Windows/macOS runtime claims are made anywhere.
 
 ## License
 

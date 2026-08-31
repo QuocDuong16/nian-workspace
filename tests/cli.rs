@@ -1,9 +1,10 @@
-//! End-to-end CLI tests: v0.1 single-workspace behavior must remain intact,
-//! and the v0.2 `--workspace-config` registry mode must expose exactly its
-//! mode-specific MCP tool surface (M5: discovery plus the full capability
-//! set — read, Git, patching, and command execution — every tool selecting
-//! one workspace by logical WorkspaceId, mutation and execution gated by
-//! that workspace's own configured capabilities).
+//! End-to-end CLI tests (the M6 final compatibility/integration suite):
+//! the v0.1 single-workspace behavior must remain intact, and the v0.2
+//! `--workspace-config` registry mode must expose exactly its mode-specific
+//! MCP tool surface — discovery plus the full capability set (read, Git,
+//! patching, and command execution), every tool selecting one workspace by
+//! logical WorkspaceId, mutation and execution gated by that workspace's own
+//! configured capabilities.
 //!
 //! Both modes are verified by driving a real MCP stdio session:
 //! initialize, tools/list, and tools/call exchanges against the actual
