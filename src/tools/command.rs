@@ -8,12 +8,27 @@
 //!   involved, so there is no string interpolation to inject through.
 //! * **shell mode** (`"shell": true`): the command line is routed through the
 //!   platform shell (`/bin/sh` on Unix, `cmd.exe` on Windows). This is only
-//!   accepted when the server was started with `--allow-shell`.
+//!   accepted when shell execution is allowed for the workspace.
+//!
+//! The process machinery lives in the context-based core
+//! ([`run_command_for_context`]) shared by both server modes (v0.2 M5): the
+//! single-mode wrapper keeps the exact v0.1 CLI permission gates, and the
+//! registry-mode wrapper selects a workspace by logical [`WorkspaceId`],
+//! enforces that workspace's own `exec`/`shell` capabilities before any
+//! process can be spawned, and attaches provenance to the response. The
+//! child's working directory always resolves through the selected context's
+//! hardened workspace resolver — never a process-global cwd.
 
-use crate::config::AppState;
+use crate::config::{AppState, Limits};
 use crate::error::{ToolError, ToolResult};
 use crate::process::ProcessTreeGuard;
+use crate::tools::discovery::{
+    require_registry_exec, require_registry_shell, resolve_registry_workspace,
+    with_workspace_provenance,
+};
 use crate::tools::{decode_lossy, read_capped, CappedBytes};
+use crate::workspace::{PathPresentation, WorkspaceContext};
+use crate::workspace_id::WorkspaceId;
 use rmcp::schemars;
 use serde_json::json;
 use std::process::Stdio;
@@ -64,18 +79,80 @@ pub struct RunCommandArgs {
     pub timeout_seconds: Option<u64>,
 }
 
+/// Registry-mode `run_command` input: the logical workspace selector plus the
+/// unchanged single-mode arguments, flattened into one MCP input schema
+/// (no nested `args` object). The selected workspace's own `exec` capability
+/// (plus `shell` for shell=true) decides whether anything is spawned.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RegistryRunCommandArgs {
+    /// Logical workspace ID to operate on — exactly one of the IDs reported by list_workspaces.
+    #[schemars(
+        description = "Logical workspace ID to operate on — exactly one of the IDs reported by list_workspaces, as configured by the operator at startup. Not a path."
+    )]
+    pub workspace: WorkspaceId,
+    #[serde(flatten)]
+    pub args: RunCommandArgs,
+}
+
+/// Single-workspace mode entry point: the exact v0.1 behavior and permission
+/// gates, then the shared core with v0.1 path presentation.
 pub(crate) async fn handle(
     state: &AppState,
     args: RunCommandArgs,
 ) -> ToolResult<serde_json::Value> {
-    let limits = state.limits();
-    let ws = state.workspace();
+    run_command_for_context(
+        state.single_workspace(),
+        state.limits(),
+        PathPresentation::SingleCompatible,
+        args,
+    )
+    .await
+}
+
+/// Registry-mode `run_command`: exact [`WorkspaceId`] lookup, then the
+/// selected workspace's own `exec` (and, for shell requests, `shell`)
+/// capability enforced **before** any cwd resolution or process creation —
+/// a denied workspace never spawns anything. The shared context-based core
+/// runs the process; the response carries logical workspace provenance.
+pub(crate) async fn registry_run_command(
+    state: &AppState,
+    args: RegistryRunCommandArgs,
+) -> ToolResult<serde_json::Value> {
+    let RegistryRunCommandArgs { workspace, args } = args;
+    let ctx = resolve_registry_workspace(state, &workspace)?;
+    require_registry_exec(&ctx, &workspace)?;
+    if args.shell {
+        require_registry_shell(&ctx, &workspace)?;
+    }
+    let value = run_command_for_context(
+        &ctx,
+        state.limits(),
+        PathPresentation::RegistryRelative,
+        args,
+    )
+    .await?;
+    Ok(with_workspace_provenance(value, &workspace))
+}
+
+/// Context-based core shared by both server modes: identical invocation,
+/// timeout, containment, and bounded-output behavior, with the child's cwd
+/// resolved through the selected context's hardened resolver. `presentation`
+/// decides how server-resolved cwd paths are rendered in client-visible
+/// errors; the internal permission gates preserve the exact v0.1 semantics
+/// for single mode (registry wrappers enforce their own gates earlier).
+pub(crate) async fn run_command_for_context(
+    ctx: &WorkspaceContext,
+    limits: &Limits,
+    presentation: PathPresentation,
+    args: RunCommandArgs,
+) -> ToolResult<serde_json::Value> {
+    let ws = ctx.resolver();
 
     let cwd = ws.resolve(args.cwd.as_deref())?;
     if !cwd.is_dir() {
         return Err(ToolError::msg(format!(
             "Working directory '{}' does not exist or is not a directory.",
-            ws.display_relative(&cwd)
+            ws.display_relative_as(&cwd, presentation)
         )));
     }
 
@@ -95,7 +172,7 @@ pub(crate) async fn handle(
     }
 
     let invocation = if args.shell {
-        state.permissions().require_shell()?;
+        ctx.permissions().require_shell()?;
         let cmdline = args
             .command
             .as_deref()
@@ -113,7 +190,7 @@ pub(crate) async fn handle(
             command_line: cmdline.to_string(),
         }
     } else {
-        state.permissions().require_exec()?;
+        ctx.permissions().require_exec()?;
         let program = args
             .program
             .as_deref()
@@ -1239,5 +1316,293 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("Failed to start command"));
+    }
+
+    // -- registry-mode wrapper (v0.2 M5) --------------------------------------
+
+    fn rid(s: &str) -> WorkspaceId {
+        WorkspaceId::parse(s).expect("fixture workspace id")
+    }
+
+    /// Five-workspace registry for the capability matrix: alpha/beta exec-only
+    /// with identical relative file layouts but distinct content (cwd
+    /// isolation), gamma exec-only (shell denied), delta exec+shell, locked
+    /// nothing.
+    fn registry_fixture() -> (TempDir, AppState) {
+        let tmp = TempDir::new().unwrap();
+        let mut config = String::from("version = 1\n\n");
+        for (name, caps) in [
+            ("alpha", "exec = true\n"),
+            ("beta", "exec = true\n"),
+            ("gamma", "exec = true\n"),
+            ("delta", "exec = true\nallow_shell = true\n"),
+            ("locked", ""),
+        ] {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(dir.join("sub")).unwrap();
+            std::fs::write(dir.join("sub/marker.txt"), format!("{name} marker\n")).unwrap();
+            config.push_str(&format!(
+                "[workspaces.{name}]\nroot = '{}'\n{caps}\n",
+                dir.display()
+            ));
+        }
+        let registry = crate::registry::WorkspaceRegistry::from_toml_str(&config).unwrap();
+        (tmp, AppState::from_registry(registry))
+    }
+
+    fn reg_args(workspace: &str, args: RunCommandArgs) -> RegistryRunCommandArgs {
+        RegistryRunCommandArgs {
+            workspace: rid(workspace),
+            args,
+        }
+    }
+
+    fn direct(program: &str, argv: &[&str]) -> RunCommandArgs {
+        RunCommandArgs {
+            program: Some(program.into()),
+            args: Some(argv.iter().map(|s| s.to_string()).collect()),
+            shell: false,
+            command: None,
+            cwd: None,
+            timeout_seconds: None,
+        }
+    }
+
+    fn shell(command_line: &str) -> RunCommandArgs {
+        RunCommandArgs {
+            program: None,
+            args: None,
+            shell: true,
+            command: Some(command_line.into()),
+            cwd: None,
+            timeout_seconds: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_command_runs_in_the_selected_workspace_and_carries_provenance() {
+        let (_t, state) = registry_fixture();
+        // Identical relative requests against two workspaces must each see
+        // only their own context's content: the selected WorkspaceContext
+        // alone decides the child cwd — no process-global cwd, no mutable
+        // current workspace.
+        let out = registry_run_command(
+            &state,
+            reg_args("alpha", direct("cat", &["sub/marker.txt"])),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["workspace"], json!("alpha"));
+        assert_eq!(out["exit_code"], json!(0));
+        assert_eq!(out["stdout"], "alpha marker\n");
+
+        let out =
+            registry_run_command(&state, reg_args("beta", direct("cat", &["sub/marker.txt"])))
+                .await
+                .unwrap();
+        assert_eq!(out["workspace"], json!("beta"));
+        assert_eq!(out["stdout"], "beta marker\n");
+    }
+
+    #[tokio::test]
+    async fn registry_command_denied_exec_never_spawns_a_process() {
+        let (tmp, state) = registry_fixture();
+        // If a process were spawned despite the denial it would create this
+        // marker inside the denied workspace.
+        let marker = tmp.path().join("locked").join("spawned-anyway");
+        let err = registry_run_command(
+            &state,
+            reg_args(
+                "locked",
+                direct("touch", &[marker.to_str().expect("utf-8 tmp path")]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Workspace 'locked' does not allow command execution."),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains(tmp.path().to_string_lossy().as_ref()),
+            "permission error must not expose roots: {msg}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(!marker.exists(), "denied command spawned a process anyway");
+
+        // shell=true on the same workspace is stopped by the exec gate that
+        // runs first — also without any spawn.
+        let err = registry_run_command(&state, reg_args("locked", shell("true")))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Workspace 'locked' does not allow command execution."),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registry_shell_denial_never_spawns_a_shell() {
+        let (tmp, state) = registry_fixture();
+        let marker = tmp.path().join("gamma").join("shell-ran");
+        let err = registry_run_command(
+            &state,
+            reg_args("gamma", shell(&format!("touch {}", marker.display()))),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Workspace 'gamma' does not allow shell execution."),
+            "{msg}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(!marker.exists(), "denied shell spawned a process anyway");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registry_shell_allowed_when_the_workspace_permits_it() {
+        let (_t, state) = registry_fixture();
+        let out = registry_run_command(&state, reg_args("delta", shell("echo shell-marker")))
+            .await
+            .unwrap();
+        assert_eq!(out["workspace"], json!("delta"));
+        assert_eq!(out["exit_code"], json!(0));
+        assert!(
+            out["stdout"].as_str().unwrap().contains("shell-marker"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_command_cwd_stays_inside_the_selected_workspace() {
+        let (tmp, state) = registry_fixture();
+        // A subdirectory cwd resolves inside the selected workspace.
+        let out = registry_run_command(
+            &state,
+            reg_args(
+                "alpha",
+                RunCommandArgs {
+                    cwd: Some("sub".into()),
+                    ..direct("cat", &["marker.txt"])
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["stdout"], "alpha marker\n");
+
+        // Sibling traversal is rejected by the resolver before any spawn.
+        let err = registry_run_command(
+            &state,
+            reg_args(
+                "alpha",
+                RunCommandArgs {
+                    cwd: Some("../beta".into()),
+                    ..direct("cat", &["sub/marker.txt"])
+                },
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("outside the configured workspace"),
+            "{err}"
+        );
+
+        // Absolute paths outside the selected root are rejected too — even
+        // ancestors of the workspace.
+        let err = registry_run_command(
+            &state,
+            reg_args(
+                "alpha",
+                RunCommandArgs {
+                    cwd: Some("/".into()),
+                    ..direct("true", &[])
+                },
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("outside the configured workspace"),
+            "{err}"
+        );
+
+        // The registered neighbor was never touched by any of it.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("beta/sub/marker.txt")).unwrap(),
+            "beta marker\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registry_command_rejects_symlinked_cwd_into_sibling() {
+        let (tmp, state) = registry_fixture();
+        std::os::unix::fs::symlink("../beta", tmp.path().join("alpha/leak")).unwrap();
+        let err = registry_run_command(
+            &state,
+            reg_args(
+                "alpha",
+                RunCommandArgs {
+                    cwd: Some("leak".into()),
+                    ..direct("cat", &["sub/marker.txt"])
+                },
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("outside the configured workspace"),
+            "{err}"
+        );
+        // A registered sibling is not unlocked by being registered: alpha's
+        // boundary stays closed.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("beta/sub/marker.txt")).unwrap(),
+            "beta marker\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_unknown_workspace_is_bounded_and_spawns_nothing() {
+        let (_t, state) = registry_fixture();
+        let err = registry_run_command(&state, reg_args("does-not-exist", direct("echo", &["hi"])))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unknown workspace 'does-not-exist'")
+                && msg.contains("Use list_workspaces to discover valid workspace IDs"),
+            "{msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registry_timeout_metadata_and_provenance_are_preserved() {
+        let (_t, state) = registry_fixture();
+        let out = registry_run_command(
+            &state,
+            reg_args(
+                "alpha",
+                RunCommandArgs {
+                    timeout_seconds: Some(1),
+                    ..direct("sleep", &["30"])
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["workspace"], json!("alpha"));
+        assert_eq!(out["timed_out"], json!(true));
+        assert_eq!(out["exit_code"], serde_json::Value::Null);
+        assert!(out["message"].as_str().unwrap().contains("timeout"));
+        assert!(out["duration_ms"].as_u64().is_some());
     }
 }

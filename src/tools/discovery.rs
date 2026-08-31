@@ -100,6 +100,46 @@ pub(crate) fn unknown_workspace(requested: &WorkspaceId) -> ToolError {
     ))
 }
 
+/// Registry-mode capability gates for the mutating/executing tools (v0.2 M5):
+/// the selected context's own configured capabilities decide — there is no
+/// global permission promotion, no capability cache, and no fallback. The
+/// errors are bounded, name the logical workspace id, and never contain
+/// filesystem roots. Single-workspace mode keeps its own CLI-flag-worded
+/// gates ([`crate::permissions::Permissions`]); these are the registry
+/// counterparts.
+pub(crate) fn require_registry_write(ctx: &WorkspaceContext, id: &WorkspaceId) -> ToolResult<()> {
+    if ctx.permissions().write {
+        Ok(())
+    } else {
+        Err(ToolError::msg(format!(
+            "Workspace '{id}' does not allow file writes."
+        )))
+    }
+}
+
+pub(crate) fn require_registry_exec(ctx: &WorkspaceContext, id: &WorkspaceId) -> ToolResult<()> {
+    if ctx.permissions().exec {
+        Ok(())
+    } else {
+        Err(ToolError::msg(format!(
+            "Workspace '{id}' does not allow command execution."
+        )))
+    }
+}
+
+/// Shell capability gate. The caller checks exec separately first (the
+/// `shell = true` ⇒ `exec = true` config rule is already enforced at
+/// startup), so this only inspects the shell capability itself.
+pub(crate) fn require_registry_shell(ctx: &WorkspaceContext, id: &WorkspaceId) -> ToolResult<()> {
+    if ctx.permissions().shell {
+        Ok(())
+    } else {
+        Err(ToolError::msg(format!(
+            "Workspace '{id}' does not allow shell execution."
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +355,41 @@ mod tests {
             !message.contains(tmp.path().to_string_lossy().as_ref()),
             "errors must not expose filesystem roots: {message}"
         );
+    }
+
+    #[test]
+    fn registry_capability_gates_name_the_workspace_without_roots() {
+        let tmp = TempDir::new().unwrap();
+        let ws = crate::workspace::Workspace::open(tmp.path()).unwrap();
+        let id = WorkspaceId::parse("locked").unwrap();
+        let ctx = WorkspaceContext::new(
+            Some(id.clone()),
+            ws,
+            crate::permissions::Permissions::default(),
+        );
+
+        for (err, capability) in [
+            (
+                require_registry_write(&ctx, &id).unwrap_err().to_string(),
+                "file writes",
+            ),
+            (
+                require_registry_exec(&ctx, &id).unwrap_err().to_string(),
+                "command execution",
+            ),
+            (
+                require_registry_shell(&ctx, &id).unwrap_err().to_string(),
+                "shell execution",
+            ),
+        ] {
+            assert!(
+                err.contains("Workspace 'locked'") && err.contains(capability),
+                "gate message must name the workspace and capability: {err}"
+            );
+            assert!(
+                !err.contains(tmp.path().to_string_lossy().as_ref()),
+                "capability errors must not expose roots: {err}"
+            );
+        }
     }
 }

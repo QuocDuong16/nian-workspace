@@ -14,9 +14,22 @@
 //! * an unexpected filesystem failure during the final commit phase may
 //!   leave a multi-file patch partially applied — this tool does not provide
 //!   rollback across files
+//!
+//! The patch machinery lives in the context-based core
+//! ([`apply_patch_for_context`]) shared by both server modes (v0.2 M5): the
+//! single-mode wrapper keeps the exact v0.1 CLI permission gate, and the
+//! registry-mode wrapper selects a workspace by logical [`WorkspaceId`],
+//! enforces that workspace's own `write` capability before anything is
+//! parsed or touched, and attaches provenance to the response. Client-visible
+//! path rendering follows the mode's [`PathPresentation`] contract.
 
 use crate::config::AppState;
 use crate::error::{ToolError, ToolResult};
+use crate::tools::discovery::{
+    require_registry_write, resolve_registry_workspace, with_workspace_provenance,
+};
+use crate::workspace::{PathPresentation, Workspace, WorkspaceContext};
+use crate::workspace_id::WorkspaceId;
 use rmcp::schemars;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -28,6 +41,21 @@ pub struct ApplyPatchArgs {
         description = "Unified diff text in 'diff -u'/'git diff' format. May contain multiple files. All hunks are validated before mutation; each individual file replacement is atomic, but an unexpected filesystem failure during the commit phase can leave a multi-file patch partially applied."
     )]
     pub patch: String,
+}
+
+/// Registry-mode `apply_patch` input: the logical workspace selector plus the
+/// unchanged single-mode arguments, flattened into one MCP input schema
+/// (no nested `args` object). The selected workspace's own `write`
+/// capability decides whether the patch is applied at all.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RegistryApplyPatchArgs {
+    /// Logical workspace ID to operate on — exactly one of the IDs reported by list_workspaces.
+    #[schemars(
+        description = "Logical workspace ID to operate on — exactly one of the IDs reported by list_workspaces, as configured by the operator at startup. Not a path."
+    )]
+    pub workspace: WorkspaceId,
+    #[serde(flatten)]
+    pub args: ApplyPatchArgs,
 }
 
 #[derive(Debug)]
@@ -87,9 +115,42 @@ impl Hunk {
 // Tool entry point
 // ---------------------------------------------------------------------------
 
+/// Single-workspace mode entry point: the exact v0.1 CLI permission gate,
+/// then the shared core with v0.1 path presentation.
 pub(crate) fn handle(state: &AppState, args: ApplyPatchArgs) -> ToolResult<serde_json::Value> {
     state.permissions().require_write()?;
-    let ws = state.workspace();
+    apply_patch_for_context(
+        state.single_workspace(),
+        PathPresentation::SingleCompatible,
+        args,
+    )
+}
+
+/// Registry-mode `apply_patch`: exact [`WorkspaceId`] lookup, the selected
+/// workspace's own `write` capability enforced **before** anything is parsed
+/// or validated (a denied workspace is never probed or mutated), then the
+/// shared context-based core and logical workspace provenance.
+pub(crate) fn registry_apply_patch(
+    state: &AppState,
+    args: RegistryApplyPatchArgs,
+) -> ToolResult<serde_json::Value> {
+    let RegistryApplyPatchArgs { workspace, args } = args;
+    let ctx = resolve_registry_workspace(state, &workspace)?;
+    require_registry_write(&ctx, &workspace)?;
+    let value = apply_patch_for_context(&ctx, PathPresentation::RegistryRelative, args)?;
+    Ok(with_workspace_provenance(value, &workspace))
+}
+
+/// Context-based core shared by both server modes: identical parse, validate,
+/// and atomic-write behavior rooted at the selected context. `presentation`
+/// decides how server-resolved paths are rendered in the response and in
+/// errors; the caller owns the permission gate.
+pub(crate) fn apply_patch_for_context(
+    ctx: &WorkspaceContext,
+    presentation: PathPresentation,
+    args: ApplyPatchArgs,
+) -> ToolResult<serde_json::Value> {
+    let ws = ctx.resolver();
 
     if args.patch.trim().is_empty() {
         return Err(ToolError::msg("Patch text is empty."));
@@ -113,7 +174,7 @@ pub(crate) fn handle(state: &AppState, args: ApplyPatchArgs) -> ToolResult<serde
         let resolved = ws.resolve(Some(requested)).map_err(|e| {
             ToolError::msg(format!("Rejecting patch target '{}': {e}", file.new_path))
         })?;
-        plans.push((ws.display_relative(&resolved), resolved));
+        plans.push((ws.display_relative_as(&resolved, presentation), resolved));
     }
 
     // Build all new contents fully in memory first.
@@ -184,7 +245,7 @@ pub(crate) fn handle(state: &AppState, args: ApplyPatchArgs) -> ToolResult<serde
     // Note: each replacement is individually atomic, but a failure part-way
     // through this loop leaves earlier files written (documented limitation).
     for (_rel, resolved, bytes) in &staged {
-        atomic_write(resolved, bytes)?;
+        atomic_write(resolved, ws, presentation, bytes)?;
         tracing::info!(target = %resolved.display(), "applied patch");
     }
 
@@ -235,17 +296,35 @@ fn decode_utf8(bytes: &[u8], display: &str) -> ToolResult<String> {
     })
 }
 
+/// Render a server-resolved path for error messages under the active
+/// presentation contract. v0.1 single mode shows the raw resolved path
+/// (absolute, byte-for-byte as always); registry mode re-renders it relative
+/// to the selected workspace so canonical roots never appear in
+/// client-visible errors.
+fn render_error_path(ws: &Workspace, path: &Path, presentation: PathPresentation) -> String {
+    match presentation {
+        PathPresentation::SingleCompatible => path.to_string_lossy().into_owned(),
+        PathPresentation::RegistryRelative => ws.display_relative_as(path, presentation),
+    }
+}
+
 /// Replace `target` atomically: write a fresh exclusive sibling temp file,
 /// carry over the old file's permissions where applicable, then rename over
 /// the target. Readers never observe a torn file, and the temp name cannot
 /// collide or be pre-planted (exclusive creation in the same directory).
-fn atomic_write(target: &Path, bytes: &[u8]) -> ToolResult<()> {
+fn atomic_write(
+    target: &Path,
+    ws: &Workspace,
+    presentation: PathPresentation,
+    bytes: &[u8],
+) -> ToolResult<()> {
     use std::io::Write;
+    let target_display = render_error_path(ws, target, presentation);
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             ToolError::msg(format!(
                 "Failed to create directory '{}': {e}",
-                parent.display()
+                render_error_path(ws, parent, presentation)
             ))
         })?;
     }
@@ -262,8 +341,7 @@ fn atomic_write(target: &Path, bytes: &[u8]) -> ToolResult<()> {
         )
         .map_err(|e| {
             ToolError::msg(format!(
-                "Failed to create temp file next to '{}': {e}",
-                target.display()
+                "Failed to create temp file next to '{target_display}': {e}"
             ))
         })?;
     tmp.write_all(bytes)
@@ -280,35 +358,38 @@ fn atomic_write(target: &Path, bytes: &[u8]) -> ToolResult<()> {
     match std::fs::metadata(target) {
         Ok(meta) => {
             use std::os::unix::fs::PermissionsExt;
-            apply_preserved_mode(tmp.path(), meta.permissions().mode())?;
+            apply_preserved_mode(
+                tmp.path(),
+                &render_error_path(ws, tmp.path(), presentation),
+                meta.permissions().mode(),
+            )?;
         }
         // New file (creation patch): default exclusive-temp permissions apply.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
             return Err(ToolError::msg(format!(
-                "Cannot stat '{}' to preserve its permissions: {e}",
-                target.display()
+                "Cannot stat '{target_display}' to preserve its permissions: {e}"
             )))
         }
     }
 
     tmp.persist(target)
-        .map_err(|e| ToolError::msg(format!("Failed to replace '{}': {e}", target.display())))?;
+        .map_err(|e| ToolError::msg(format!("Failed to replace '{target_display}': {e}")))?;
     Ok(())
 }
 
 /// Carry `mode` over to the replacement file at `dest`. Any failure is an
 /// error — never silently ignored — so the caller aborts BEFORE persisting
-/// and the original file stays untouched.
+/// and the original file stays untouched. `dest_display` is the
+/// presentation-rendered spelling used in the error message.
 #[cfg(unix)]
-fn apply_preserved_mode(dest: &Path, mode: u32) -> ToolResult<()> {
+fn apply_preserved_mode(dest: &Path, dest_display: &str, mode: u32) -> ToolResult<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(dest, std::fs::Permissions::from_mode(mode)).map_err(|e| {
         ToolError::msg(format!(
-            "Failed to preserve permission mode {:o} on replacement for '{}': {e}. \
+            "Failed to preserve permission mode {:o} on replacement for '{dest_display}': {e}. \
              Original file left unchanged.",
-            mode,
-            dest.display()
+            mode
         ))
     })
 }
@@ -946,7 +1027,7 @@ mod tests {
         // a clear error naming the preserved mode.
         let tmp = TempDir::new().unwrap();
         let missing = tmp.path().join("no-such-tmp-file");
-        let err = apply_preserved_mode(&missing, 0o755).unwrap_err();
+        let err = apply_preserved_mode(&missing, "no-such-tmp-file", 0o755).unwrap_err();
         assert!(
             err.to_string()
                 .contains("Failed to preserve permission mode"),
@@ -980,6 +1061,233 @@ mod tests {
             mode & 0o777,
             0o755,
             "permission bits changed by atomic replacement"
+        );
+    }
+
+    // -- registry-mode wrapper (v0.2 M5) --------------------------------------
+
+    fn rid(s: &str) -> WorkspaceId {
+        WorkspaceId::parse(s).expect("fixture workspace id")
+    }
+
+    /// Four-workspace registry: alpha and beta are writable (exec off) with
+    /// the same-named file but different content, exec-only has exec but no
+    /// write, locked has nothing. Root non-disclosure and per-workspace
+    /// capability enforcement are the points under test.
+    fn registry_fixture() -> (TempDir, AppState) {
+        let tmp = TempDir::new().unwrap();
+        let mut config = String::from("version = 1\n\n");
+        for (name, caps, content) in [
+            ("alpha", "write = true\n", "ALPHA_ORIGINAL\n"),
+            ("beta", "write = true\n", "BETA_ORIGINAL\n"),
+            ("execonly", "exec = true\n", "EXECONLY_ORIGINAL\n"),
+            ("locked", "", "LOCKED_ORIGINAL\n"),
+        ] {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("shared.txt"), content).unwrap();
+            config.push_str(&format!(
+                "[workspaces.{name}]\nroot = '{}'\n{caps}\n",
+                dir.display()
+            ));
+        }
+        let registry = crate::registry::WorkspaceRegistry::from_toml_str(&config).unwrap();
+        (tmp, AppState::from_registry(registry))
+    }
+
+    fn replace_first_line_patch(old: &str, new: &str) -> String {
+        format!("--- shared.txt\n+++ shared.txt\n@@ -1,1 +1,1 @@\n-{old}\n+{new}\n")
+    }
+
+    #[test]
+    fn registry_patch_applies_to_the_selected_workspace_only() {
+        let (tmp, state) = registry_fixture();
+        let out = registry_apply_patch(
+            &state,
+            RegistryApplyPatchArgs {
+                workspace: rid("alpha"),
+                args: ApplyPatchArgs {
+                    patch: replace_first_line_patch("ALPHA_ORIGINAL", "ALPHA_PATCHED"),
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(out["workspace"], json!("alpha"));
+        assert_eq!(out["changed_files"][0], json!("shared.txt"));
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("alpha/shared.txt")).unwrap(),
+            "ALPHA_PATCHED\n"
+        );
+        // The registered neighbor is byte-for-byte unchanged.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("beta/shared.txt")).unwrap(),
+            "BETA_ORIGINAL\n"
+        );
+        // No absolute roots anywhere in the response.
+        let rendered = out.to_string();
+        assert!(
+            !rendered.contains(tmp.path().to_string_lossy().as_ref()),
+            "patch response must not expose roots: {rendered}"
+        );
+    }
+
+    #[test]
+    fn registry_patch_requires_the_selected_workspaces_write_capability() {
+        let (tmp, state) = registry_fixture();
+        let err = registry_apply_patch(
+            &state,
+            RegistryApplyPatchArgs {
+                workspace: rid("locked"),
+                args: ApplyPatchArgs {
+                    patch: replace_first_line_patch("LOCKED_ORIGINAL", "X"),
+                },
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Workspace 'locked' does not allow file writes."),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains(tmp.path().to_string_lossy().as_ref()),
+            "permission error must not expose roots: {msg}"
+        );
+        // Rejected before any mutation: the file is untouched.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("locked/shared.txt")).unwrap(),
+            "LOCKED_ORIGINAL\n"
+        );
+    }
+
+    #[test]
+    fn registry_patch_write_capability_is_independent_of_exec() {
+        // write=true alone (alpha, exec off) patches fine — proven by the
+        // applies-only test above; here, exec alone must not unlock patching.
+        let (tmp, state) = registry_fixture();
+        let err = registry_apply_patch(
+            &state,
+            RegistryApplyPatchArgs {
+                workspace: rid("execonly"),
+                args: ApplyPatchArgs {
+                    patch: replace_first_line_patch("EXECONLY_ORIGINAL", "X"),
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Workspace 'execonly' does not allow file writes."),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("execonly/shared.txt")).unwrap(),
+            "EXECONLY_ORIGINAL\n"
+        );
+    }
+
+    #[test]
+    fn registry_patch_rejects_escape_targets_before_any_mutation() {
+        let (tmp, state) = registry_fixture();
+        let patch = "--- ../beta/shared.txt\n+++ ../beta/shared.txt\n@@ -1,1 +1,1 @@\n-BETA_ORIGINAL\n+HACKED\n";
+        let err = registry_apply_patch(
+            &state,
+            RegistryApplyPatchArgs {
+                workspace: rid("alpha"),
+                args: ApplyPatchArgs {
+                    patch: patch.into(),
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Rejecting patch target"), "{err}");
+        // Beta is untouched: a registered neighbor stays outside alpha's
+        // boundary.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("beta/shared.txt")).unwrap(),
+            "BETA_ORIGINAL\n"
+        );
+    }
+
+    #[test]
+    fn registry_multi_file_patch_validates_everything_before_mutation() {
+        let (tmp, state) = registry_fixture();
+        // One valid alpha target + one escaping target: the whole patch must
+        // fail in validation and the valid hunk must not be committed.
+        let patch = concat!(
+            "--- shared.txt\n+++ shared.txt\n@@ -1,1 +1,1 @@\n-ALPHA_ORIGINAL\n+ALPHA_PATCHED\n",
+            "--- ../locked/escaped.txt\n+++ ../locked/escaped.txt\n@@ -1,1 +1,1 @@\n-x\n+y\n",
+        );
+        let err = registry_apply_patch(
+            &state,
+            RegistryApplyPatchArgs {
+                workspace: rid("alpha"),
+                args: ApplyPatchArgs {
+                    patch: patch.into(),
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Rejecting patch target"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("alpha/shared.txt")).unwrap(),
+            "ALPHA_ORIGINAL\n",
+            "the valid hunk must not be partially committed"
+        );
+        assert!(!tmp.path().join("locked/escaped.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_patch_rejects_symlink_escape_into_sibling_workspace() {
+        let (tmp, state) = registry_fixture();
+        std::os::unix::fs::symlink("../beta", tmp.path().join("alpha/leak")).unwrap();
+        let patch =
+            "--- leak/shared.txt\n+++ leak/shared.txt\n@@ -1,1 +1,1 @@\n-BETA_ORIGINAL\n+HACKED\n";
+        let err = registry_apply_patch(
+            &state,
+            RegistryApplyPatchArgs {
+                workspace: rid("alpha"),
+                args: ApplyPatchArgs {
+                    patch: patch.into(),
+                },
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Rejecting patch target")
+                && msg.contains("outside the configured workspace"),
+            "{msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("beta/shared.txt")).unwrap(),
+            "BETA_ORIGINAL\n"
+        );
+    }
+
+    #[test]
+    fn registry_patch_unknown_workspace_is_bounded_before_parsing() {
+        let (_tmp, state) = registry_fixture();
+        // Even a garbage patch text must produce the bounded lookup error —
+        // the id boundary runs before anything is parsed.
+        let err = registry_apply_patch(
+            &state,
+            RegistryApplyPatchArgs {
+                workspace: rid("does-not-exist"),
+                args: ApplyPatchArgs {
+                    patch: "not even a patch".into(),
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Unknown workspace 'does-not-exist'")
+                && err
+                    .to_string()
+                    .contains("Use list_workspaces to discover valid workspace IDs"),
+            "{err}"
         );
     }
 }
