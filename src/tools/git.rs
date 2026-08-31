@@ -251,16 +251,20 @@ fn ensure_git(ctx: &WorkspaceContext, presentation: PathPresentation) -> ToolRes
 ///
 /// Git's own bounded stderr diagnostics are preserved — raw `git` error text
 /// is genuinely useful and blindly stripping it would hide real problems —
-/// but under [`PathPresentation::RegistryRelative`] any occurrence of the
+/// but under [`PathPresentation::RegistryRelative`] every occurrence of the
 /// selected workspace's canonical root, or of the enclosing repository's
 /// root (when git can discover it), is re-rendered workspace-relative so a
 /// raw diagnostic can never disclose an absolute filesystem root. Single
 /// mode keeps git's text byte-for-byte, as in v0.1.
 ///
-/// Best-effort on Windows, where git's own path spelling in stderr may use
-/// different separators than the canonical root; the primary disclosure
-/// guards remain the workspace-relative rendering above and the workspace
-/// scoping in [`git_process`].
+/// Redaction covers the equivalent spellings the Windows/Rust/Git stack
+/// actually emits (see [`path_display_variants`]): both separator
+/// directions and the `\\?\` verbatim prefix Rust's canonicalization
+/// produces. Matching stays boundary-aware (see [`replace_path_prefix`]), so
+/// a root never rewrites an unrelated longer path such as
+/// `C:\repo\alpha-other`. This is presentation-layer sanitization only:
+/// filesystem identity, containment, authorization, and resolution remain
+/// exclusively in the workspace resolver.
 fn presented_git_error(
     raw: &str,
     ctx: &WorkspaceContext,
@@ -269,7 +273,6 @@ fn presented_git_error(
     if presentation == PathPresentation::SingleCompatible {
         return ToolError::msg(raw.to_string());
     }
-    let mut text = raw.to_string();
     // The enclosing repository root, when discoverable: parent repositories
     // are exactly what the workspace scoping exists to cross, so their
     // absolute paths must not leak either. One extra hardened probe, on the
@@ -284,16 +287,62 @@ fn presented_git_error(
     .ok()
     .map(|out| out.stdout.trim().trim_end_matches('/').to_string())
     .unwrap_or_default();
+    let root_str = ctx.root().to_string_lossy().into_owned();
+    let mut roots: Vec<&str> = vec![root_str.as_str()];
     if !toplevel.is_empty() && toplevel != "/" {
-        text = replace_path_prefix(&text, &toplevel, ".");
+        roots.push(toplevel.as_str());
     }
-    text = replace_path_prefix(&text, ctx.root().to_string_lossy().as_ref(), ".");
-    ToolError::msg(text)
+    ToolError::msg(redact_display_variants(raw, &roots, "."))
+}
+
+/// Redact every display spelling variant of every root from `text`,
+/// replacing the longest spellings first so a verbatim-prefix form is
+/// consumed before its stripped form and a workspace root before an
+/// enclosing repository root. A bare `/` root discloses nothing and is
+/// left alone.
+fn redact_display_variants(text: &str, canonical_roots: &[&str], replacement: &str) -> String {
+    let mut needles: Vec<String> = canonical_roots
+        .iter()
+        .copied()
+        .filter(|root| !root.is_empty() && *root != "/")
+        .flat_map(path_display_variants)
+        .collect();
+    needles.sort_by_key(|needle| std::cmp::Reverse(needle.len()));
+    let mut text = text.to_string();
+    for needle in needles {
+        text = replace_path_prefix(&text, &needle, replacement);
+    }
+    text
+}
+
+/// The common equivalent display spellings of one canonical path: the path
+/// itself, its verbatim-prefix-stripped form (`\\?\C:\…` is what Rust's
+/// canonicalization produces on Windows), and the separator-swapped twin of
+/// each — Git prints forward slashes on Windows where Rust stores
+/// backslashes. Deduplicated and ordered deterministically; on Unix the
+/// backslash twins simply never match anything. Used only for disclosure
+/// prevention, never for path decisions.
+fn path_display_variants(canonical: &str) -> Vec<String> {
+    let mut forms: Vec<String> = vec![canonical.to_string()];
+    if let Some(stripped) = canonical.strip_prefix(r"\\?\") {
+        forms.push(stripped.to_string());
+    }
+    let mut variants: Vec<String> = Vec::new();
+    for form in &forms {
+        variants.push(form.clone());
+        variants.push(form.replace('\\', "/"));
+        variants.push(form.replace('/', "\\"));
+    }
+    variants.retain(|v| !v.is_empty());
+    variants.sort();
+    variants.dedup();
+    variants
 }
 
 /// Replace occurrences of `root` in `text` with `replacement` only where the
-/// following byte ends a path component (separator, quote, whitespace, or
-/// end of text), so `/ws/root` never rewrites an unrelated `/ws/root-2`.
+/// following byte ends a path component — either path separator (`/` and
+/// `\`, on any platform), a quote, whitespace, or end of text — so
+/// `/ws/root` never rewrites an unrelated `/ws/root-2`.
 fn replace_path_prefix(text: &str, root: &str, replacement: &str) -> String {
     if root.is_empty() {
         return text.to_string();
@@ -304,7 +353,10 @@ fn replace_path_prefix(text: &str, root: &str, replacement: &str) -> String {
         out.push_str(&rest[..at]);
         rest = &rest[at + root.len()..];
         let ends_component = rest.as_bytes().first().is_none_or(|&b| {
-            matches!(b, b'/' | b'\'' | b'"' | b' ' | b'\t' | b':' | b'\n' | b'\r')
+            matches!(
+                b,
+                b'/' | b'\\' | b'\'' | b'"' | b' ' | b'\t' | b':' | b'\n' | b'\r'
+            )
         });
         if ends_component {
             out.push_str(replacement);
@@ -1319,5 +1371,104 @@ mod tests {
             !msg.contains(repo_str.trim_start_matches('/')),
             "parent repository root leaked: {msg}"
         );
+    }
+
+    // -- cross-platform redaction unit tests (v0.2 M4 remediation) -----------
+    //
+    // Pure string-level tests: the Windows redaction behavior must be
+    // verifiable even though the CI runner is Linux. The Rust literals below
+    // use `\\` so the actual test strings carry single backslashes, exactly
+    // as a Windows canonical root or diagnostic would.
+
+    #[test]
+    fn redaction_treats_backslash_as_a_path_separator() {
+        let redacted = redact_display_variants(
+            r"fatal: cannot open 'C:\repo\alpha\file.txt'",
+            &[r"C:\repo\alpha"],
+            ".",
+        );
+        // The root is gone and the useful suffix/diagnostic remains, with
+        // its original separator spelling preserved.
+        assert_eq!(redacted, r"fatal: cannot open '.\file.txt'");
+    }
+
+    #[test]
+    fn redaction_covers_the_forward_slash_git_spelling() {
+        // Git on Windows prints forward slashes even when the canonical root
+        // uses backslashes; the derived variant must still match.
+        let redacted = redact_display_variants(
+            r"fatal: cannot open 'C:/repo/alpha/file.txt'",
+            &[r"C:\repo\alpha"],
+            ".",
+        );
+        assert_eq!(redacted, r"fatal: cannot open './file.txt'");
+    }
+
+    #[test]
+    fn redaction_consumes_the_verbatim_prefix_form_before_its_stripped_form() {
+        // Rust's canonicalize() produces \\?\-prefixed paths on Windows; the
+        // verbatim spelling must be redacted whole (longest variant first),
+        // leaving neither the root nor a stray prefix behind.
+        let redacted = redact_display_variants(
+            r"fatal: bad object '\\?\C:\repo\alpha\file.txt'",
+            &[r"\\?\C:\repo\alpha"],
+            ".",
+        );
+        assert_eq!(redacted, r"fatal: bad object '.\file.txt'");
+    }
+
+    #[test]
+    fn redaction_never_rewrites_a_prefix_collision_sibling() {
+        // A longer unrelated path sharing the root as a string prefix must
+        // not be rewritten — in either separator spelling.
+        for sibling in [
+            r"fatal: cannot open 'C:\repo\alpha-other\file.txt'",
+            "fatal: cannot open 'C:/repo/alpha-other/file.txt'",
+        ] {
+            let redacted = redact_display_variants(sibling, &[r"C:\repo\alpha"], ".");
+            assert_eq!(redacted, sibling, "prefix collision must not be rewritten");
+        }
+    }
+
+    #[test]
+    fn redaction_unix_root_still_redacts() {
+        let redacted = redact_display_variants(
+            "fatal: cannot open '/home/user/project/file'",
+            &["/home/user/project"],
+            ".",
+        );
+        assert_eq!(redacted, "fatal: cannot open './file'");
+    }
+
+    #[test]
+    fn path_display_variants_are_deduplicated_and_cover_both_spellings() {
+        let variants = path_display_variants(r"C:\repo\alpha");
+        assert!(
+            variants.contains(&r"C:\repo\alpha".to_string()),
+            "{variants:?}"
+        );
+        assert!(
+            variants.contains(&"C:/repo/alpha".to_string()),
+            "{variants:?}"
+        );
+        let unique: std::collections::HashSet<&String> = variants.iter().collect();
+        assert_eq!(unique.len(), variants.len(), "no duplicates: {variants:?}");
+
+        // A verbatim-prefix canonical root also yields its stripped form and
+        // the stripped form's forward-slash twin.
+        let verbatim = path_display_variants(r"\\?\C:\repo\alpha");
+        assert!(
+            verbatim.contains(&r"C:\repo\alpha".to_string()),
+            "{verbatim:?}"
+        );
+        assert!(
+            verbatim.contains(&"C:/repo/alpha".to_string()),
+            "{verbatim:?}"
+        );
+
+        // Unix paths keep their exact spelling (the backslash twin never
+        // matches anything and is harmless).
+        let unix = path_display_variants("/home/user/project");
+        assert!(unix.contains(&"/home/user/project".to_string()), "{unix:?}");
     }
 }
