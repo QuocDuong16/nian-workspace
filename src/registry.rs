@@ -98,11 +98,11 @@ impl WorkspaceRegistry {
 
     /// Exact logical-id lookup. No case folding, no aliasing, no fallbacks.
     ///
-    /// Reserved for workspace-id request routing in a later milestone (M2);
-    /// M1 tools never call it.
-    #[allow(dead_code)]
-    pub fn get(&self, id: &WorkspaceId) -> Option<&Arc<WorkspaceContext>> {
-        self.workspaces.get(id)
+    /// Returns the context as an owned [`Arc`] so a request handler can hold
+    /// it independently of the registry borrow; cloning an `Arc` is cheap and
+    /// the registry itself remains immutable.
+    pub fn get(&self, id: &WorkspaceId) -> Option<Arc<WorkspaceContext>> {
+        self.workspaces.get(id).cloned()
     }
 
     /// All contexts in deterministic workspace-id order, for diagnostics.

@@ -1,4 +1,9 @@
-//! MCP server: tool surface and [`ServerHandler`] implementation.
+//! Single-workspace MCP server: the complete v0.1 tool surface, unchanged.
+//!
+//! Constructed **only** in [`RuntimeMode::SingleWorkspace`]: every tool is
+//! rooted at the one fixed workspace with CLI-derived permissions, and no
+//! tool takes a workspace selector (v0.1 client compatibility). Registry
+//! mode uses the separate [`super::RegistryServer`] instead.
 //!
 //! Every tool returns either a successful [`CallToolResult`] carrying JSON
 //! (both structured content and a pretty-printed text fallback) or a

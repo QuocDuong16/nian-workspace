@@ -65,9 +65,10 @@ impl Default for Limits {
 /// The runtime workspace model, decided entirely at startup (v0.2 M1).
 ///
 /// There is deliberately no mutable "current workspace": MCP requests cannot
-/// switch roots, and no default workspace exists in registry mode. A later
-/// milestone will dispatch tool calls through either mode explicitly; M1
-/// leaves this representation in place so that dispatch needs no redesign.
+/// switch roots, and no default workspace exists in registry mode. Routing is
+/// mode-specific by construction (v0.2 M2): each transport selects one of two
+/// separate MCP servers from this mode, so a registry-mode request can never
+/// reach single-workspace tool code and vice versa.
 #[derive(Debug, Clone)]
 pub enum RuntimeMode {
     /// v0.1 behavior: one fixed canonical workspace root plus CLI permissions.
@@ -108,13 +109,26 @@ impl AppState {
     }
 
     /// The single workspace context. Only meaningful in
-    /// [`RuntimeMode::SingleWorkspace`] — registry mode stops before MCP
-    /// serving in M1, so tools can never observe a registry-mode state.
+    /// [`RuntimeMode::SingleWorkspace`] — the registry-mode server never
+    /// calls single-workspace accessors, so this is an internal programming
+    /// contract, not a client-reachable path.
     pub fn single_workspace(&self) -> &WorkspaceContext {
         match &self.mode {
             RuntimeMode::SingleWorkspace(ctx) => ctx,
             RuntimeMode::WorkspaceRegistry(_) => {
                 unreachable!("single-workspace accessors are unavailable in registry mode")
+            }
+        }
+    }
+
+    /// The workspace registry. Only meaningful in
+    /// [`RuntimeMode::WorkspaceRegistry`] — only the registry-mode server
+    /// calls this, so the inverse contract of [`Self::single_workspace`].
+    pub fn registry(&self) -> &WorkspaceRegistry {
+        match &self.mode {
+            RuntimeMode::WorkspaceRegistry(registry) => registry,
+            RuntimeMode::SingleWorkspace(_) => {
+                unreachable!("registry accessors are unavailable in single-workspace mode")
             }
         }
     }
@@ -166,6 +180,15 @@ impl AppState {
         let root = resolve_workspace_root(cli.workspace.as_deref())?;
         let workspace = Workspace::open(&root)?;
         Ok(Self::new(workspace, permissions, Limits::default()))
+    }
+
+    /// Registry-mode state from an already-validated registry (tests only).
+    #[cfg(test)]
+    pub(crate) fn from_registry(registry: WorkspaceRegistry) -> Self {
+        Self {
+            mode: RuntimeMode::WorkspaceRegistry(Arc::new(registry)),
+            limits: Limits::default(),
+        }
     }
 }
 

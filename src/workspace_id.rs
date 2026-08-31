@@ -73,6 +73,26 @@ impl std::str::FromStr for WorkspaceId {
     }
 }
 
+/// MCP tool-argument schema for workspace selectors.
+///
+/// Exposing the id grammar directly in the advertised schema lets clients
+/// validate before sending, while deserialization still enforces the same
+/// grammar server-side: a selector that violates it fails strictly at the
+/// boundary, before any lookup or path handling is attempted.
+impl rmcp::schemars::JsonSchema for WorkspaceId {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "WorkspaceId".into()
+    }
+
+    fn json_schema(_gen: &mut rmcp::schemars::SchemaGenerator) -> rmcp::schemars::Schema {
+        rmcp::schemars::json_schema!({
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+            "description": "Logical workspace id ([a-z0-9][a-z0-9._-]{0,63}), exactly as configured by the operator at server startup. Not a filesystem path."
+        })
+    }
+}
+
 impl Serialize for WorkspaceId {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.0)

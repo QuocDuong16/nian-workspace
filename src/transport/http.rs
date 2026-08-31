@@ -10,12 +10,13 @@
 //! behind an external secure tunnel instead. Non-loopback binds are rejected
 //! with a clear error rather than merely warned about.
 
-use crate::config::AppState;
-use crate::server::NianWorkspaceServer;
+use crate::config::{AppState, RuntimeMode};
+use crate::server::{NianWorkspaceServer, RegistryServer};
 use anyhow::{bail, Context};
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
+use rmcp::ServerHandler;
 use std::net::IpAddr;
 
 /// Resolve the CLI `--host` into a bind IP, enforcing loopback-only.
@@ -67,19 +68,52 @@ fn address_preference(addrs: &[IpAddr]) -> IpAddr {
 
 pub async fn serve(state: AppState, host: &str, port: u16) -> anyhow::Result<()> {
     let addr_ip = resolve_loopback_bind(host)?;
+    let endpoint = format!("http://{addr_ip}:{port}/mcp");
 
-    tracing::info!(
-        workspace = %state.workspace().root().display(),
-        write = state.permissions().write,
-        exec = state.permissions().exec,
-        shell = state.permissions().shell,
-        endpoint = %format!("http://{addr_ip}:{port}/mcp"),
-        "starting nian-workspace over streamable HTTP"
-    );
+    match state.mode() {
+        RuntimeMode::SingleWorkspace(_) => {
+            let ws = state.single_workspace();
+            tracing::info!(
+                workspace = %ws.root().display(),
+                write = ws.permissions().write,
+                exec = ws.permissions().exec,
+                shell = ws.permissions().shell,
+                endpoint = %endpoint,
+                "starting nian-workspace over streamable HTTP"
+            );
+            let state_for_factory = state.clone();
+            run_http(
+                move || Ok(NianWorkspaceServer::new(state_for_factory.clone())),
+                addr_ip,
+                port,
+            )
+            .await
+        }
+        RuntimeMode::WorkspaceRegistry(_) => {
+            tracing::info!(
+                workspaces = state.registry().iter_sorted().len(),
+                endpoint = %endpoint,
+                "starting nian-workspace over streamable HTTP (registry mode)"
+            );
+            let state_for_factory = state.clone();
+            run_http(
+                move || Ok(RegistryServer::new(state_for_factory.clone())),
+                addr_ip,
+                port,
+            )
+            .await
+        }
+    }
+}
 
+async fn run_http<S, F>(service_factory: F, addr_ip: IpAddr, port: u16) -> anyhow::Result<()>
+where
+    S: ServerHandler + Send + 'static,
+    F: Fn() -> Result<S, std::io::Error> + Send + Sync + 'static,
+{
     let ct = tokio_util::sync::CancellationToken::new();
     let service = StreamableHttpService::new(
-        move || Ok(NianWorkspaceServer::new(state.clone())),
+        service_factory,
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token()),
     );

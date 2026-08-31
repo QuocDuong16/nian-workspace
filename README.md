@@ -2,7 +2,7 @@
 
 A secure local workspace bridge for web-hosted AI clients using MCP.
 
-`nian-workspace` lets a remote or web-hosted AI work with a local coding project through the Model Context Protocol — without exposing an unauthenticated public filesystem or shell service. A single process serves one local workspace root, providing file inspection, search, edits, controlled command execution, and Git access, always scoped to the configured directory.
+`nian-workspace` lets a remote or web-hosted AI work with a local coding project through the Model Context Protocol — without exposing an unauthenticated public filesystem or shell service. A single process serves one local workspace root — or, in registry mode, a fixed set of operator-configured workspaces — providing file inspection, search, edits, controlled command execution, and Git access, always scoped to the configured directory.
 
 The reference integration is **ChatGPT + Secure MCP Tunnel**, which connects a web-hosted AI client to a local workspace without requiring the machine to accept inbound network connections.
 
@@ -63,7 +63,7 @@ nian-workspace [WORKSPACE] [OPTIONS]
 | `--write` | Allow modifying workspace files (`apply_patch`) |
 | `--exec` | Allow executing local programs (`run_command`) |
 | `--allow-shell` | Allow commands through a system shell; requires `--exec` |
-| `--workspace-config <PATH>` | Load a versioned TOML workspace registry instead of a single workspace — see [Workspace registry configuration (v0.2 foundation)](#workspace-registry-configuration-v02-foundation) |
+| `--workspace-config <PATH>` | Load a versioned TOML workspace registry instead of a single workspace — see [Workspace registry configuration (v0.2)](#workspace-registry-configuration-v02) |
 | `--transport <stdio\|http>` | MCP transport (default: `stdio`) |
 | `--host <HOST>` | HTTP bind host — loopback only (`127.0.0.1`, `::1`, or `localhost`); non-loopback addresses are rejected |
 | `--port <PORT>` | HTTP port (default: `8787`) |
@@ -80,7 +80,7 @@ nian-workspace . --write --exec                # + run_command (no shell)
 nian-workspace . --write --exec --allow-shell  # + shell syntax (cmd.exe / /bin/sh)
 ```
 
-### Workspace registry configuration (v0.2 foundation)
+### Workspace registry configuration (v0.2)
 
 Instead of a single positional workspace root, `--workspace-config <PATH>` loads an explicitly operator-configured registry of named workspace contexts:
 
@@ -117,9 +117,23 @@ The security properties of this configuration are fixed by design:
 
 `--workspace-config` is mutually exclusive with a positional `WORKSPACE` root and with the `--write`/`--exec`/`--allow-shell` flags; combining them is rejected at startup. Transport and logging options are unchanged.
 
-> **Status:** this is the v0.2 configuration/validation foundation only. Registry mode currently validates the configuration and then stops before MCP serving — no tool accepts a workspace selector, no default workspace exists, and no single session serves multiple workspaces yet. Multi-workspace MCP tool routing arrives in a later milestone and will be documented when it actually exists.
+**Registry-mode MCP tools (v0.2 M2): discovery only.** Registry mode now starts and serves MCP, but with a deliberately smaller, mode-specific tool surface — exactly two tools:
+
+| Tool | Arguments | Effect |
+|---|---|---|
+| `list_workspaces` | none | The configured logical workspace IDs in deterministic ID order, each with its effective permissions. These IDs are the only valid workspace selectors; they are fixed by the operator at startup. |
+| `workspace_info` | `workspace` (required) | Metadata for one selected workspace: effective permissions and Git repository status. |
+
+- The `workspace` argument must be an exact, operator-configured workspace ID — no case folding, no aliases, no path interpretation, no default or fallback workspace. Unknown or malformed IDs are rejected with an explicit error (which may enumerate the configured IDs).
+- The single-workspace tools (`list_files`, `read_file`, `search`, `apply_patch`, `run_command`, `git_status`, `git_diff`) are **not** available in registry mode yet: they are not advertised, and directly invoking one is rejected as a clean MCP error while the server stays usable.
+- Registry-mode responses expose logical IDs and effective permissions only — never filesystem roots or the configuration path.
+- There is no mutable "current workspace": every request carries its own explicit ID, and concurrent calls for different workspaces are independent.
+
+Multi-workspace file listing/reading, search, patches, command execution, and git status/diff arrive in later milestones and will be documented when they actually exist.
 
 ## Tools
+
+The tool surface is mode-specific: single-workspace mode (a positional `WORKSPACE`) advertises exactly the table below with its v0.1 schemas, while registry mode (`--workspace-config`) advertises only `list_workspaces` and the workspace-selecting `workspace_info` (see [the registry section](#workspace-registry-configuration-v02)).
 
 | Tool | Read-only | Notes |
 |---|:-:|---|
@@ -134,7 +148,7 @@ The security properties of this configuration are fixed by design:
 
 ## Client setup
 
-One process owns one workspace root. This is deliberate: the workspace boundary is fixed when the process starts instead of being switched by an MCP request.
+One process owns one fixed workspace (or, with `--workspace-config`, one fixed set of operator-configured workspaces). This is deliberate: the workspace boundary is fixed when the process starts instead of being switched by an MCP request.
 
 ### ChatGPT + Secure MCP Tunnel
 
@@ -271,6 +285,7 @@ Read this before enabling flags.
 
 - **`nian-workspace` is not an OS sandbox.** Workspace isolation prevents *filesystem tools* from addressing paths outside the configured root; command execution runs real local processes with the full permissions of your OS user. A command can trivially read and modify files anywhere on your system regardless of the workspace boundary. Enable `--exec` only for MCP clients you trust.
 - **Workspace isolation** covers every filesystem-facing tool (`list_files`, `read_file`, `search`, `apply_patch`, `run_command` cwd, `git_diff` path). Requests containing `../` traversal, absolute paths outside the root, drive-letter tricks, or symlinks that resolve outside the root are rejected with explicit errors — including paths whose final component does not exist yet.
+- **Registry mode is discovery-only and startup-configured.** MCP requests select workspaces by operator-configured logical ID — never by path — and responses never contain filesystem roots. Unmigrated tools are not merely hidden from `tools/list`: they are not registered on the registry-mode router at all, so directly invoking one is rejected inside the router as `tool not found`, before any handler or workspace is touched.
 - **`--allow-shell` is a separate flag because shell execution is strictly more dangerous**: `/bin/sh` (Unix) or `cmd.exe` (Windows) interprets the whole command line, enabling chaining, redirection, and expansion. It also requires `--exec`.
 - **Outputs are bounded** (~256 KiB per channel by default) with truncation metadata, so large logs and dumps cannot flood model context.
 - **HTTP mode is loopback-only.** Non-loopback bind addresses (`0.0.0.0`, LAN IPs) are rejected at startup: there is no authentication layer, so anything that can reach the port can use the enabled tools against your filesystem. For remote access, put an external secure tunnel (TLS/auth) in front of `127.0.0.1`.

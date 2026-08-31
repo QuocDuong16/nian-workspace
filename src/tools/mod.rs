@@ -3,6 +3,7 @@
 //! value or a caller-friendly [`ToolError`](crate::error::ToolError).
 
 pub mod command;
+pub mod discovery;
 pub mod files;
 pub mod git;
 pub(crate) mod git_process;

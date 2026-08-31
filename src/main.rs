@@ -26,13 +26,9 @@ fn main() -> anyhow::Result<()> {
 
     let state = config::AppState::from_cli(&cli)?;
 
-    // v0.2 M1 transitional limitation, made explicit rather than hidden:
-    // registry mode builds and fully validates the workspace registry, but
-    // MCP tool serving in registry mode is not implemented yet. Serving the
-    // existing single-workspace tool API against a registry would require a
-    // default workspace — exactly the ambiguous routing M1 must avoid — so
-    // the process stops here instead. Workspace-id request routing arrives
-    // in a later milestone; single-workspace mode is unchanged.
+    // Registry mode: log the operator-configured workspaces once at startup
+    // (stderr only — stdout carries MCP protocol frames). Roots appear only
+    // in these operator-facing logs, never in MCP responses.
     if let config::RuntimeMode::WorkspaceRegistry(reg) = state.mode() {
         for ctx in reg.iter_sorted() {
             let id = ctx.id().expect("registry workspaces always have an id");
@@ -45,24 +41,6 @@ fn main() -> anyhow::Result<()> {
                 "workspace registered"
             );
         }
-        let ids: Vec<String> = reg
-            .iter_sorted()
-            .iter()
-            .map(|ctx| {
-                ctx.id()
-                    .expect("registry workspaces always have an id")
-                    .to_string()
-            })
-            .collect();
-        anyhow::bail!(
-            "Workspace registry loaded and validated {} workspace(s) [{}], but registry mode \
-             is not yet available for MCP tool serving in v0.2 M1: no workspace selector, \
-             default workspace, or workspace-id routing exists yet. \
-             For MCP serving, use single-workspace mode (positional WORKSPACE with optional \
-             --write/--exec/--allow-shell).",
-            reg.iter_sorted().len(),
-            ids.join(", ")
-        );
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
