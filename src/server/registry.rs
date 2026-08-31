@@ -1,26 +1,26 @@
-//! Registry-mode MCP server (v0.2 M3): workspace discovery plus read-only
-//! filesystem access.
+//! Registry-mode MCP server (v0.2 M4): workspace discovery plus read-only
+//! filesystem and Git access.
 //!
 //! Constructed **only** in [`RuntimeMode::WorkspaceRegistry`], so this tool
 //! surface is the complete, authoritative registry-mode surface. Every
-//! filesystem tool requires an explicit logical `WorkspaceId`, resolved by
-//! exact lookup into the immutable registry and served by the same
-//! hardened, context-based implementations the single-workspace server uses
-//! — no duplicated path logic, no default workspace, no mutable selection
-//! state, so concurrent calls for different workspaces are independent.
+//! filesystem or Git tool requires an explicit logical [`WorkspaceId`],
+//! resolved by exact lookup into the immutable registry and served by the
+//! same hardened, context-based implementations the single-workspace server
+//! uses — no duplicated path logic, no default workspace, no mutable
+//! selection state, so concurrent calls for different workspaces are
+//! independent.
 //!
-//! Unmigrated tools (patches, commands, git status/diff) are not registered
-//! here: `tools/list` shows only the available tools, and direct invocation
-//! of anything else is rejected by the router as `tool not found` before
-//! any workspace is touched.
+//! Unmigrated tools (patches, commands) are not registered here: `tools/list`
+//! shows only the available tools, and direct invocation of anything else is
+//! rejected by the router as `tool not found` before any workspace is touched.
 
 use crate::config::AppState;
-use crate::tools::{discovery, error_result, files, result_from_value, search};
+use crate::tools::{discovery, error_result, files, git, result_from_value, search};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 
-/// MCP server for registry mode (v0.2 M3): discovery + read-only file access.
+/// MCP server for registry mode (v0.2 M4): discovery + read-only file/Git access.
 #[derive(Clone)]
 pub struct RegistryServer {
     state: AppState,
@@ -97,6 +97,32 @@ impl RegistryServer {
             Err(err) => Ok(error_result(err)),
         }
     }
+
+    #[tool(
+        description = "Show working-tree status ('git status --short --branch' equivalent) for one selected workspace (logical ID from list_workspaces), scoped to that workspace even when it sits inside a larger parent repository. Read-only: works regardless of the workspace's write/exec permissions."
+    )]
+    fn git_status(
+        &self,
+        Parameters(args): Parameters<git::RegistryGitStatusArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        match git::registry_git_status(&self.state, args) {
+            Ok(value) => result_from_value(value),
+            Err(err) => Ok(error_result(err)),
+        }
+    }
+
+    #[tool(
+        description = "Show the unified diff of unstaged changes (or staged ones with staged=true) in one selected workspace (logical ID from list_workspaces), optionally limited to one workspace-relative path. Diff paths are relative to the selected workspace root and never leak sibling workspaces through a parent repository. Output is bounded."
+    )]
+    fn git_diff(
+        &self,
+        Parameters(args): Parameters<git::RegistryGitDiffArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        match git::registry_git_diff(&self.state, args) {
+            Ok(value) => result_from_value(value),
+            Err(err) => Ok(error_result(err)),
+        }
+    }
 }
 
 #[tool_handler(router = self.tool_router.clone())]
@@ -108,13 +134,14 @@ impl ServerHandler for RegistryServer {
                 crate::config::SERVER_VERSION.to_string(),
             ))
             .with_instructions(
-                "Workspace discovery plus read-only file access (registry mode): \
+                "Workspace discovery plus read-only file and Git access (registry mode): \
                  list_workspaces reports the operator-configured workspace IDs, and \
-                 workspace_info, list_files, read_file, and search each require a \
-                 `workspace` argument selecting one of those IDs. Paths are \
-                 workspace-relative and responses carry the selected workspace's logical \
-                 ID as provenance. Patching, command execution, and git status/diff are \
-                 not available in registry mode yet; there is no default workspace.",
+                 workspace_info, list_files, read_file, search, git_status, and git_diff \
+                 each require a `workspace` argument selecting one of those IDs. Paths are \
+                 workspace-relative, Git output is scoped to the selected workspace, and \
+                 responses carry its logical ID as provenance. Patching and command \
+                 execution are not available in registry mode yet; there is no default \
+                 workspace.",
             )
     }
 }

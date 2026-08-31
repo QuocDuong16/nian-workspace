@@ -5,10 +5,21 @@
 //! commands are deliberately not exposed; clients holding `--exec` can use
 //! `run_command` for anything beyond these two read-only views. External
 //! diff/textconv/fsmonitor/pager execution paths are disabled there and here.
+//!
+//! The behavior lives in context-based cores ([`git_status_for_context`] /
+//! [`git_diff_for_context`]) shared by both server modes (v0.2 M4): the
+//! single-mode wrappers resolve the fixed workspace, and the registry-mode
+//! wrappers select a workspace by logical [`WorkspaceId`] and attach
+//! provenance to the response. Client-visible path rendering — including
+//! error text — follows the mode's [`PathPresentation`] contract, so
+//! registry responses and errors never disclose canonical roots.
 
-use crate::config::AppState;
+use crate::config::{AppState, Limits};
 use crate::error::{ToolError, ToolResult};
+use crate::tools::discovery::{resolve_registry_workspace, with_workspace_provenance};
 use crate::tools::git_process::{inside_git_worktree, run_git_bounded, GitInvocation};
+use crate::workspace::{PathPresentation, WorkspaceContext};
+use crate::workspace_id::WorkspaceId;
 use rmcp::schemars;
 use serde_json::json;
 
@@ -30,27 +41,119 @@ pub struct GitDiffArgs {
     pub path: Option<String>,
 }
 
-pub(crate) fn git_status(state: &AppState, _args: GitStatusArgs) -> ToolResult<serde_json::Value> {
-    ensure_git(state)?;
-    let ws = state.workspace();
-    let cap = state.limits().max_git_output;
+/// Registry-mode `git_status` input: the logical workspace selector. The
+/// single-mode `git_status` takes no further arguments, so the registry API
+/// is exactly `{ workspace }` — no invented Git options.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RegistryGitStatusArgs {
+    /// Logical workspace ID to operate on — exactly one of the IDs reported by list_workspaces.
+    #[schemars(
+        description = "Logical workspace ID to operate on — exactly one of the IDs reported by list_workspaces, as configured by the operator at startup. Not a path."
+    )]
+    pub workspace: WorkspaceId,
+    #[serde(flatten)]
+    pub args: GitStatusArgs,
+}
+
+/// Registry-mode `git_diff` input: the logical workspace selector plus the
+/// unchanged single-mode arguments, flattened into one MCP input schema
+/// (no nested `args` object).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RegistryGitDiffArgs {
+    /// Logical workspace ID to operate on — exactly one of the IDs reported by list_workspaces.
+    #[schemars(
+        description = "Logical workspace ID to operate on — exactly one of the IDs reported by list_workspaces, as configured by the operator at startup. Not a path."
+    )]
+    pub workspace: WorkspaceId,
+    #[serde(flatten)]
+    pub args: GitDiffArgs,
+}
+
+/// Single-workspace mode entry point (v0.1 behavior, unchanged).
+pub(crate) fn git_status(state: &AppState, args: GitStatusArgs) -> ToolResult<serde_json::Value> {
+    git_status_for_context(
+        state.single_workspace(),
+        state.limits(),
+        PathPresentation::SingleCompatible,
+        args,
+    )
+}
+
+/// Single-workspace mode entry point (v0.1 behavior, unchanged).
+pub(crate) fn git_diff(state: &AppState, args: GitDiffArgs) -> ToolResult<serde_json::Value> {
+    git_diff_for_context(
+        state.single_workspace(),
+        state.limits(),
+        PathPresentation::SingleCompatible,
+        args,
+    )
+}
+
+/// Registry-mode `git_status`: exact [`WorkspaceId`] lookup, the shared
+/// context-based core, then logical workspace provenance in the response.
+pub(crate) fn registry_git_status(
+    state: &AppState,
+    args: RegistryGitStatusArgs,
+) -> ToolResult<serde_json::Value> {
+    let RegistryGitStatusArgs { workspace, args } = args;
+    let ctx = resolve_registry_workspace(state, &workspace)?;
+    let value = git_status_for_context(
+        &ctx,
+        state.limits(),
+        PathPresentation::RegistryRelative,
+        args,
+    )?;
+    Ok(with_workspace_provenance(value, &workspace))
+}
+
+/// Registry-mode `git_diff`: exact [`WorkspaceId`] lookup, the shared
+/// context-based core, then logical workspace provenance in the response.
+pub(crate) fn registry_git_diff(
+    state: &AppState,
+    args: RegistryGitDiffArgs,
+) -> ToolResult<serde_json::Value> {
+    let RegistryGitDiffArgs { workspace, args } = args;
+    let ctx = resolve_registry_workspace(state, &workspace)?;
+    let value = git_diff_for_context(
+        &ctx,
+        state.limits(),
+        PathPresentation::RegistryRelative,
+        args,
+    )?;
+    Ok(with_workspace_provenance(value, &workspace))
+}
+
+/// Context-based core shared by both server modes: identical hardened status
+/// behavior, rooted at the selected context. `presentation` decides how
+/// client-visible paths are rendered, including failure text.
+pub(crate) fn git_status_for_context(
+    ctx: &WorkspaceContext,
+    limits: &Limits,
+    presentation: PathPresentation,
+    _args: GitStatusArgs,
+) -> ToolResult<serde_json::Value> {
+    ensure_git(ctx, presentation)?;
+    let cap = limits.max_git_output;
 
     // Pathspec "-- ." is the workspace-boundary guarantee: when the
     // workspace is a subdirectory of a larger repository, plain `status`
     // would report changes for the WHOLE repository (git discovers the repo
-    // root upward). Restricting to "." keeps output inside the configured
-    // workspace, no matter where the enclosing repo extends.
+    // root upward). Restricting to "." keeps output inside the selected
+    // workspace, no matter where the enclosing repo extends — independently
+    // for every selected context, without relying on process-global state
+    // (v0.2 M4 parent-repository isolation).
     //
     // Path text is pinned workspace-relative by the shared hardened config
     // (`-c status.relativePaths=true`); a user's global `relativePaths=false`
     // would otherwise leak the enclosing repo's directory prefix into every
     // line.
     let out = run_git_bounded(&GitInvocation {
-        root: ws.root(),
+        root: ctx.root(),
         args: &["--no-pager", "status", "--short", "--branch", "--", "."],
         cap,
         ok_exit_codes: &[0],
-    })?;
+    })
+    .map_err(|err| presented_git_error(&err.to_string(), ctx, presentation))?;
 
     Ok(json!({
         "output": out.stdout,
@@ -58,17 +161,29 @@ pub(crate) fn git_status(state: &AppState, _args: GitStatusArgs) -> ToolResult<s
     }))
 }
 
-pub(crate) fn git_diff(state: &AppState, args: GitDiffArgs) -> ToolResult<serde_json::Value> {
-    ensure_git(state)?;
-    let ws = state.workspace();
-    let cap = state.limits().max_git_output;
+/// Context-based core shared by both server modes: identical hardened diff
+/// behavior, rooted at the selected context.
+pub(crate) fn git_diff_for_context(
+    ctx: &WorkspaceContext,
+    limits: &Limits,
+    presentation: PathPresentation,
+    args: GitDiffArgs,
+) -> ToolResult<serde_json::Value> {
+    ensure_git(ctx, presentation)?;
+    let ws = ctx.resolver();
+    let cap = limits.max_git_output;
 
     let resolved_path = match args.path.as_deref() {
         Some(p) => {
+            // The workspace resolver stays the single path-isolation
+            // authority: the diff pathspec is derived only from an
+            // already-validated workspace-relative path, never from raw
+            // client input, so a Git path selector can never become a second
+            // way to address another workspace or the parent repository.
             let resolved = ws
                 .resolve(Some(p))
                 .map_err(|e| ToolError::msg(format!("Invalid diff path '{p}': {e}")))?;
-            Some(ws.display_relative(&resolved))
+            Some(ws.display_relative_as(&resolved, presentation))
         }
         None => None,
     };
@@ -105,11 +220,12 @@ pub(crate) fn git_diff(state: &AppState, args: GitDiffArgs) -> ToolResult<serde_
     }
 
     let out = run_git_bounded(&GitInvocation {
-        root: ws.root(),
+        root: ctx.root(),
         args: &cmd_args,
         cap,
         ok_exit_codes: &[0],
-    })?;
+    })
+    .map_err(|err| presented_git_error(&err.to_string(), ctx, presentation))?;
 
     Ok(json!({
         "staged": args.staged,
@@ -119,15 +235,85 @@ pub(crate) fn git_diff(state: &AppState, args: GitDiffArgs) -> ToolResult<serde_
     }))
 }
 
-fn ensure_git(state: &AppState) -> ToolResult<()> {
-    if inside_git_worktree(state.workspace().root()) {
+fn ensure_git(ctx: &WorkspaceContext, presentation: PathPresentation) -> ToolResult<()> {
+    if inside_git_worktree(ctx.root()) {
         Ok(())
     } else {
         Err(ToolError::msg(format!(
             "'{}' does not appear to be inside a Git working tree.",
-            state.workspace().root().display()
+            ctx.resolver().display_relative_as(ctx.root(), presentation)
         )))
     }
+}
+
+/// Render a failed git invocation for the client under the active
+/// presentation contract (v0.2 M4 root non-disclosure).
+///
+/// Git's own bounded stderr diagnostics are preserved — raw `git` error text
+/// is genuinely useful and blindly stripping it would hide real problems —
+/// but under [`PathPresentation::RegistryRelative`] any occurrence of the
+/// selected workspace's canonical root, or of the enclosing repository's
+/// root (when git can discover it), is re-rendered workspace-relative so a
+/// raw diagnostic can never disclose an absolute filesystem root. Single
+/// mode keeps git's text byte-for-byte, as in v0.1.
+///
+/// Best-effort on Windows, where git's own path spelling in stderr may use
+/// different separators than the canonical root; the primary disclosure
+/// guards remain the workspace-relative rendering above and the workspace
+/// scoping in [`git_process`].
+fn presented_git_error(
+    raw: &str,
+    ctx: &WorkspaceContext,
+    presentation: PathPresentation,
+) -> ToolError {
+    if presentation == PathPresentation::SingleCompatible {
+        return ToolError::msg(raw.to_string());
+    }
+    let mut text = raw.to_string();
+    // The enclosing repository root, when discoverable: parent repositories
+    // are exactly what the workspace scoping exists to cross, so their
+    // absolute paths must not leak either. One extra hardened probe, on the
+    // failure path only; if it fails, the workspace root below is still
+    // scrubbed.
+    let toplevel = run_git_bounded(&GitInvocation {
+        root: ctx.root(),
+        args: &["--no-pager", "rev-parse", "--show-toplevel"],
+        cap: 4 * 1024,
+        ok_exit_codes: &[0],
+    })
+    .ok()
+    .map(|out| out.stdout.trim().trim_end_matches('/').to_string())
+    .unwrap_or_default();
+    if !toplevel.is_empty() && toplevel != "/" {
+        text = replace_path_prefix(&text, &toplevel, ".");
+    }
+    text = replace_path_prefix(&text, ctx.root().to_string_lossy().as_ref(), ".");
+    ToolError::msg(text)
+}
+
+/// Replace occurrences of `root` in `text` with `replacement` only where the
+/// following byte ends a path component (separator, quote, whitespace, or
+/// end of text), so `/ws/root` never rewrites an unrelated `/ws/root-2`.
+fn replace_path_prefix(text: &str, root: &str, replacement: &str) -> String {
+    if root.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(root) {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + root.len()..];
+        let ends_component = rest.as_bytes().first().is_none_or(|&b| {
+            matches!(b, b'/' | b'\'' | b'"' | b' ' | b'\t' | b':' | b'\n' | b'\r')
+        });
+        if ends_component {
+            out.push_str(replacement);
+        } else {
+            out.push_str(root);
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -697,6 +883,441 @@ mod tests {
         assert!(
             !root.join("workspace").exists(),
             "apply_patch created a workspace/workspace path from repo-root-relative headers"
+        );
+    }
+
+    // -- registry-mode wrappers (v0.2 M4) ------------------------------------
+
+    fn rid(s: &str) -> WorkspaceId {
+        WorkspaceId::parse(s).expect("fixture workspace id")
+    }
+
+    /// Two-workspace registry where each workspace is its own committed
+    /// repository with distinctly named files, so any cross-workspace bleed
+    /// is unambiguous.
+    fn registry_repos_fixture() -> (TempDir, AppState) {
+        let tmp = TempDir::new().unwrap();
+        let alpha = tmp.path().join("alpha");
+        let beta = tmp.path().join("beta");
+        for (dir, name) in [(&alpha, "alpha"), (&beta, "beta")] {
+            std::fs::create_dir_all(dir).unwrap();
+            git(dir, &["init", "--initial-branch=main"]);
+            pin_local_config(dir);
+            std::fs::write(dir.join(format!("{name}_tracked.txt")), "original\n").unwrap();
+            git(dir, &["add", "."]);
+            git(dir, &["commit", "-m", "initial"]);
+        }
+        let config = format!(
+            "version = 1\n\n[workspaces.alpha]\nroot = '{}'\n\n[workspaces.beta]\nroot = '{}'\n",
+            alpha.display(),
+            beta.display()
+        );
+        let registry = crate::registry::WorkspaceRegistry::from_toml_str(&config).unwrap();
+        (tmp, AppState::from_registry(registry))
+    }
+
+    /// One parent repository containing both registered workspaces as
+    /// subdirectories — the parent-repository isolation fixture.
+    fn registry_parent_repo_fixture() -> (TempDir, AppState) {
+        let tmp = TempDir::new().unwrap();
+        let alpha = tmp.path().join("alpha");
+        let beta = tmp.path().join("beta");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(&beta).unwrap();
+        git(tmp.path(), &["init", "--initial-branch=main"]);
+        pin_local_config(tmp.path());
+        std::fs::write(alpha.join("alpha.txt"), "original\n").unwrap();
+        std::fs::write(beta.join("beta.txt"), "original\n").unwrap();
+        git(tmp.path(), &["add", "."]);
+        git(tmp.path(), &["commit", "-m", "initial"]);
+        let config = format!(
+            "version = 1\n\n[workspaces.alpha]\nroot = '{}'\n\n[workspaces.beta]\nroot = '{}'\n",
+            alpha.display(),
+            beta.display()
+        );
+        let registry = crate::registry::WorkspaceRegistry::from_toml_str(&config).unwrap();
+        (tmp, AppState::from_registry(registry))
+    }
+
+    #[test]
+    fn registry_status_and_diff_are_scoped_and_carry_provenance() {
+        let (tmp, state) = registry_repos_fixture();
+        let alpha = tmp.path().join("alpha");
+        let beta = tmp.path().join("beta");
+        // One unstaged modification + one untracked file in alpha; one
+        // staged change in beta.
+        std::fs::write(alpha.join("alpha_tracked.txt"), "ALPHA_MARK\n").unwrap();
+        std::fs::write(alpha.join("alpha_untracked.txt"), "x\n").unwrap();
+        std::fs::write(beta.join("beta_tracked.txt"), "BETA_MARK\n").unwrap();
+        git(&beta, &["add", "."]);
+
+        let out = registry_git_status(
+            &state,
+            RegistryGitStatusArgs {
+                workspace: rid("alpha"),
+                args: GitStatusArgs {},
+            },
+        )
+        .expect("registry status must succeed");
+        assert_eq!(out["workspace"], json!("alpha"));
+        let output = out["output"].as_str().unwrap();
+        assert!(
+            output.contains(" M alpha_tracked.txt") && output.contains("?? alpha_untracked.txt"),
+            "alpha changes missing: {output}"
+        );
+        assert!(
+            !output.contains("beta_tracked.txt") && !output.contains("BETA_MARK"),
+            "beta change leaked: {output}"
+        );
+
+        let out = registry_git_diff(
+            &state,
+            RegistryGitDiffArgs {
+                workspace: rid("alpha"),
+                args: GitDiffArgs {
+                    staged: false,
+                    path: None,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(out["workspace"], json!("alpha"));
+        assert_eq!(out["staged"], json!(false));
+        let diff = out["diff"].as_str().unwrap();
+        assert!(diff.contains("+ALPHA_MARK"), "{diff}");
+        assert!(
+            !diff.contains("BETA_MARK") && !diff.contains("beta"),
+            "{diff}"
+        );
+
+        // staged selection matches single-mode semantics for the same context
+        let out = registry_git_diff(
+            &state,
+            RegistryGitDiffArgs {
+                workspace: rid("beta"),
+                args: GitDiffArgs {
+                    staged: true,
+                    path: None,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(out["staged"], json!(true));
+        assert!(out["diff"].as_str().unwrap().contains("+BETA_MARK"));
+        let out = registry_git_diff(
+            &state,
+            RegistryGitDiffArgs {
+                workspace: rid("beta"),
+                args: GitDiffArgs {
+                    staged: false,
+                    path: None,
+                },
+            },
+        )
+        .unwrap();
+        assert!(out["diff"].as_str().unwrap().trim().is_empty());
+
+        // No absolute roots anywhere in the success responses (the final
+        // `out` above is beta's staged diff).
+        let out_str = out.to_string();
+        for root in [alpha.as_path(), beta.as_path()] {
+            let root = root.to_string_lossy();
+            assert!(
+                !out_str.contains(root.trim_start_matches('/')),
+                "root leaked into registry response: {out_str}"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_parent_repo_isolation_holds_per_context() {
+        let (_tmp, state) = registry_parent_repo_fixture();
+        let registry = state.registry();
+        let alpha = registry.get(&rid("alpha")).unwrap().root().to_path_buf();
+        let beta = registry.get(&rid("beta")).unwrap().root().to_path_buf();
+        std::fs::write(alpha.join("alpha.txt"), "original\nALPHA_MARK\n").unwrap();
+        std::fs::write(beta.join("beta.txt"), "original\nBETA_MARK\n").unwrap();
+
+        // status(alpha) reports alpha's change only, even though both
+        // workspaces resolve into the same parent repository.
+        let out = registry_git_status(
+            &state,
+            RegistryGitStatusArgs {
+                workspace: rid("alpha"),
+                args: GitStatusArgs {},
+            },
+        )
+        .unwrap();
+        let output = out["output"].as_str().unwrap();
+        assert!(output.contains(" M alpha.txt"), "{output}");
+        assert!(
+            !output.contains("beta.txt") && !output.contains("BETA_MARK"),
+            "sibling change leaked through the parent repository: {output}"
+        );
+
+        let out = registry_git_diff(
+            &state,
+            RegistryGitDiffArgs {
+                workspace: rid("alpha"),
+                args: GitDiffArgs {
+                    staged: false,
+                    path: None,
+                },
+            },
+        )
+        .unwrap();
+        let diff = out["diff"].as_str().unwrap();
+        assert!(
+            diff.contains("--- a/alpha.txt") && diff.contains("+++ b/alpha.txt"),
+            "diff headers must be workspace-relative: {diff}"
+        );
+        assert!(diff.contains("+ALPHA_MARK"), "{diff}");
+        assert!(
+            !diff.contains("beta.txt") && !diff.contains("BETA_MARK"),
+            "sibling diff leaked through the parent repository: {diff}"
+        );
+
+        // The inverse view for beta.
+        let out = registry_git_status(
+            &state,
+            RegistryGitStatusArgs {
+                workspace: rid("beta"),
+                args: GitStatusArgs {},
+            },
+        )
+        .unwrap();
+        let output = out["output"].as_str().unwrap();
+        assert!(output.contains(" M beta.txt"), "{output}");
+        assert!(
+            !output.contains("alpha.txt") && !output.contains("ALPHA_MARK"),
+            "sibling change leaked through the parent repository: {output}"
+        );
+
+        let out = registry_git_diff(
+            &state,
+            RegistryGitDiffArgs {
+                workspace: rid("beta"),
+                args: GitDiffArgs {
+                    staged: false,
+                    path: None,
+                },
+            },
+        )
+        .unwrap();
+        let diff = out["diff"].as_str().unwrap();
+        assert!(
+            diff.contains("+++ b/beta.txt") && diff.contains("+BETA_MARK"),
+            "{diff}"
+        );
+        assert!(
+            !diff.contains("alpha.txt") && !diff.contains("ALPHA_MARK"),
+            "sibling diff leaked through the parent repository: {diff}"
+        );
+    }
+
+    #[test]
+    fn registry_diff_path_is_validated_against_the_selected_workspace() {
+        let (tmp, state) = registry_repos_fixture();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(alpha.join("src")).unwrap();
+        std::fs::write(alpha.join("src/a.rs"), "original\n").unwrap();
+        std::fs::write(alpha.join("src/b.rs"), "original\n").unwrap();
+        git(&alpha, &["add", "."]);
+        git(&alpha, &["commit", "-m", "add src"]);
+        std::fs::write(alpha.join("src/a.rs"), "MARK_A\n").unwrap();
+        std::fs::write(alpha.join("src/b.rs"), "MARK_B\n").unwrap();
+
+        // A valid workspace-relative path filters the diff.
+        let out = registry_git_diff(
+            &state,
+            RegistryGitDiffArgs {
+                workspace: rid("alpha"),
+                args: GitDiffArgs {
+                    staged: false,
+                    path: Some("src/a.rs".into()),
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(out["path"], json!("src/a.rs"));
+        let diff = out["diff"].as_str().unwrap();
+        assert!(diff.contains("+MARK_A"), "{diff}");
+        assert!(!diff.contains("MARK_B") && !diff.contains("b.rs"), "{diff}");
+
+        // A sibling-workspace pathspec is rejected by the workspace resolver
+        // before any git process runs.
+        let err = registry_git_diff(
+            &state,
+            RegistryGitDiffArgs {
+                workspace: rid("alpha"),
+                args: GitDiffArgs {
+                    staged: false,
+                    path: Some("../beta/beta_tracked.txt".into()),
+                },
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Invalid diff path") && msg.contains("outside the configured workspace"),
+            "'{msg}"
+        );
+        assert!(
+            !msg.contains(tmp.path().to_string_lossy().as_ref()),
+            "path rejection must not expose roots: {msg}"
+        );
+    }
+
+    #[test]
+    fn registry_non_repository_error_presents_dot_not_the_root() {
+        let tmp = TempDir::new().unwrap();
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let config = format!(
+            "version = 1\n\n[workspaces.plain]\nroot = '{}'\n",
+            plain.display()
+        );
+        let registry = crate::registry::WorkspaceRegistry::from_toml_str(&config).unwrap();
+        let state = AppState::from_registry(registry);
+
+        for err in [
+            registry_git_status(
+                &state,
+                RegistryGitStatusArgs {
+                    workspace: rid("plain"),
+                    args: GitStatusArgs {},
+                },
+            )
+            .unwrap_err(),
+            registry_git_diff(
+                &state,
+                RegistryGitDiffArgs {
+                    workspace: rid("plain"),
+                    args: GitDiffArgs {
+                        staged: false,
+                        path: None,
+                    },
+                },
+            )
+            .unwrap_err(),
+        ] {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("does not appear to be inside a Git working tree"),
+                "{msg}"
+            );
+            assert!(
+                msg.contains("'.'"),
+                "registry presentation must render the root as '.': {msg}"
+            );
+            assert!(
+                !msg.contains(plain.to_string_lossy().as_ref()),
+                "registry error must not expose the canonical root: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_mode_non_repository_error_keeps_the_v01_absolute_root() {
+        let tmp = TempDir::new().unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        let state = AppState::new(ws, Permissions::default(), Limits::default());
+        let msg = git_status(&state, GitStatusArgs {})
+            .unwrap_err()
+            .to_string();
+        let canonical = tmp.path().canonicalize().unwrap();
+        assert!(
+            msg.contains(canonical.to_string_lossy().as_ref()),
+            "v0.1 presentation keeps the canonical absolute root in the error: {msg}"
+        );
+    }
+
+    #[test]
+    fn registry_unknown_and_malformed_ids_reach_no_git_process() {
+        let (tmp, state) = registry_repos_fixture();
+
+        // Valid grammar, unknown id: the bounded M2 error. Routing fails
+        // inside resolve_registry_workspace, before any git invocation.
+        let err = registry_git_status(
+            &state,
+            RegistryGitStatusArgs {
+                workspace: rid("does-not-exist"),
+                args: GitStatusArgs {},
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unknown workspace 'does-not-exist'")
+                && msg.contains("Use list_workspaces to discover valid workspace IDs"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains(tmp.path().to_string_lossy().as_ref()),
+            "bounded error must not expose roots: {msg}"
+        );
+
+        // Grammar violations cannot even enter the tool layer: the
+        // WorkspaceId boundary rejects them at deserialization (verified
+        // end-to-end in tests/cli.rs).
+        for bad in ["../foo", "/tmp/foo", "Nian-Vision"] {
+            assert!(
+                WorkspaceId::parse(bad).is_err(),
+                "'{bad}' must fail the id grammar"
+            );
+        }
+    }
+
+    #[test]
+    fn git_error_presentation_scrubs_roots_at_component_boundaries() {
+        let tmp = TempDir::new().unwrap();
+        let ws_dir = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let ws = Workspace::open(&ws_dir).unwrap();
+        let ctx = WorkspaceContext::new(Some(rid("ws")), ws, Permissions::default());
+        let root = ctx.root().to_string_lossy().into_owned();
+
+        // Outside a repository the toplevel probe simply fails; the scrubber
+        // must tolerate that and still scrub the workspace root.
+        let raw = format!("fatal: trouble at '{root}/.git' and {root}-2/kept plus {root} tail");
+        let msg = presented_git_error(&raw, &ctx, PathPresentation::RegistryRelative).to_string();
+        assert!(msg.contains("'./.git'"), "quoted root scrubbed: {msg}");
+        assert!(
+            msg.contains(&format!("{root}-2/kept")),
+            "a longer sibling path must not be rewritten: {msg}"
+        );
+        assert!(
+            msg.matches(&root).count() == 1,
+            "only the sibling occurrence of the root text may remain: {msg}"
+        );
+        assert!(msg.contains(". tail"), "trailing root scrubbed: {msg}");
+
+        // Single mode keeps git's text byte-for-byte (v0.1 contract).
+        let kept = presented_git_error(&raw, &ctx, PathPresentation::SingleCompatible).to_string();
+        assert_eq!(kept, raw);
+    }
+
+    #[test]
+    fn git_error_presentation_scrubs_the_parent_repository_root() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let ws_dir = repo.join("ws");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        git(&repo, &["init", "--initial-branch=main"]);
+        pin_local_config(&repo);
+        let ws = Workspace::open(&ws_dir).unwrap();
+        let ctx = WorkspaceContext::new(Some(rid("ws")), ws, Permissions::default());
+
+        let repo_str = repo.canonicalize().unwrap().to_string_lossy().into_owned();
+        let raw = format!("fatal: broken objects under {repo_str}/objects");
+        let msg = presented_git_error(&raw, &ctx, PathPresentation::RegistryRelative).to_string();
+        assert!(
+            msg.contains("fatal: broken objects under ./objects"),
+            "parent repository root must be scrubbed: {msg}"
+        );
+        assert!(
+            !msg.contains(repo_str.trim_start_matches('/')),
+            "parent repository root leaked: {msg}"
         );
     }
 }

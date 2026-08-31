@@ -1,7 +1,7 @@
 //! End-to-end CLI tests: v0.1 single-workspace behavior must remain intact,
 //! and the v0.2 `--workspace-config` registry mode must expose exactly its
-//! mode-specific MCP tool surface (M3: discovery + read-only filesystem
-//! tools, each selecting one workspace by logical WorkspaceId).
+//! mode-specific MCP tool surface (M4: discovery + read-only filesystem and
+//! Git tools, each selecting one workspace by logical WorkspaceId).
 //!
 //! Both modes are verified by driving a real MCP stdio session:
 //! initialize, tools/list, and tools/call exchanges against the actual
@@ -86,6 +86,34 @@ fn write_config(config: &str) -> (TempDir, PathBuf) {
 // ---------------------------------------------------------------------------
 // M2 session driver: sequential request/response over a real stdio session
 // ---------------------------------------------------------------------------
+
+/// Run a git command in `dir`, asserting success. Test fixtures only:
+/// identity is pinned per-invocation (per-child env), never process-wide.
+fn git(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .output()
+        .expect("git should be installed for tests");
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Pin repo-locally the behaviors a host ~/.gitconfig could otherwise flip
+/// and break fixture assertions with (repo-local config outranks global).
+fn pin_repo_config(dir: &Path) {
+    git(dir, &["config", "status.showUntrackedFiles", "normal"]);
+    git(dir, &["config", "diff.noprefix", "false"]);
+}
 
 /// A live MCP stdio session against the real binary. Requests are sent one
 /// at a time and each response is waited for, so every later exchange in a
@@ -334,6 +362,85 @@ fn cross_workspace_registry() -> (TempDir, PathBuf) {
     (tmp, path)
 }
 
+/// alpha/beta registry where each workspace is its own committed git
+/// repository with distinctly named files, so any cross-workspace bleed in
+/// Git output is unambiguous.
+fn independent_repos_registry() -> (TempDir, PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let alpha = tmp.path().join("alpha");
+    let beta = tmp.path().join("beta");
+    for (dir, name) in [(&alpha, "alpha"), (&beta, "beta")] {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "--initial-branch=main"]);
+        pin_repo_config(dir);
+        std::fs::write(dir.join(format!("{name}_tracked.txt")), "original\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "initial"]);
+    }
+    let config = registry_config(
+        "version = 1",
+        &[
+            workspace_entry("alpha", &alpha, ""),
+            workspace_entry("beta", &beta, ""),
+        ],
+    );
+    let path = tmp.path().join("workspaces.toml");
+    std::fs::write(&path, config).unwrap();
+    (tmp, path)
+}
+
+/// One git repository containing both registered workspaces as
+/// subdirectories — the parent-repository isolation fixture (v0.2 M4).
+fn parent_repo_registry() -> (TempDir, PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    let alpha = repo.join("alpha");
+    let beta = repo.join("beta");
+    std::fs::create_dir_all(&alpha).unwrap();
+    std::fs::create_dir_all(&beta).unwrap();
+    git(&repo, &["init", "--initial-branch=main"]);
+    pin_repo_config(&repo);
+    std::fs::write(alpha.join("alpha.txt"), "original\n").unwrap();
+    std::fs::write(beta.join("beta.txt"), "original\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "initial"]);
+    let config = registry_config(
+        "version = 1",
+        &[
+            workspace_entry("alpha", &alpha, ""),
+            workspace_entry("beta", &beta, ""),
+        ],
+    );
+    let path = tmp.path().join("workspaces.toml");
+    std::fs::write(&path, config).unwrap();
+    (tmp, path)
+}
+
+/// One committed git repository (alpha) plus one plain directory (plain) —
+/// for Git error-presentation and health-after-failure tests.
+fn git_and_plain_registry() -> (TempDir, PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let alpha = tmp.path().join("alpha");
+    let plain = tmp.path().join("plain");
+    std::fs::create_dir_all(&alpha).unwrap();
+    std::fs::create_dir_all(&plain).unwrap();
+    git(&alpha, &["init", "--initial-branch=main"]);
+    pin_repo_config(&alpha);
+    std::fs::write(alpha.join("alpha_tracked.txt"), "original\n").unwrap();
+    git(&alpha, &["add", "."]);
+    git(&alpha, &["commit", "-m", "initial"]);
+    let config = registry_config(
+        "version = 1",
+        &[
+            workspace_entry("alpha", &alpha, ""),
+            workspace_entry("plain", &plain, ""),
+        ],
+    );
+    let path = tmp.path().join("workspaces.toml");
+    std::fs::write(&path, config).unwrap();
+    (tmp, path)
+}
+
 #[test]
 fn single_mode_tools_list_is_exactly_the_v01_surface() {
     let tmp = TempDir::new().unwrap();
@@ -368,9 +475,15 @@ fn single_mode_tools_list_is_exactly_the_v01_surface() {
         "v0.1 response shape: {content}"
     );
 
-    // M3 must not have grown a workspace selector on the single-mode read
-    // tools: their advertised schemas keep the exact v0.1 shape.
-    for (id, tool) in (10..).zip(["list_files", "read_file", "search"]) {
+    // M3/M4 must not have grown a workspace selector on the single-mode
+    // read or Git tools: their advertised schemas keep the exact v0.1 shape.
+    for (id, tool) in (10..).zip([
+        "list_files",
+        "read_file",
+        "search",
+        "git_status",
+        "git_diff",
+    ]) {
         let schema = session.tool_schema(id, tool);
         let required = schema["required"].as_array().cloned().unwrap_or_default();
         assert!(
@@ -423,6 +536,83 @@ fn single_mode_root_paths_follow_the_v01_contract() {
     assert!(response.get("error").is_none(), "{response}");
     let content = &response["result"]["structuredContent"];
     assert_eq!(content["path"], serde_json::json!(root), "{content}");
+
+    let (code, stderr) = session.shutdown();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+}
+
+#[test]
+fn single_mode_git_tools_keep_the_v01_contract() {
+    // A real repository: both Git tools work with the exact v0.1 input
+    // format, and neither response grows a workspace provenance field.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    git(root, &["init", "--initial-branch=main"]);
+    pin_repo_config(root);
+    std::fs::write(root.join("tracked.txt"), "line one\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-m", "initial"]);
+    std::fs::write(root.join("tracked.txt"), "line CHANGED\n").unwrap();
+
+    let mut session = McpSession::start(&[tmp.path().to_str().unwrap()]);
+    session.initialize();
+
+    let response = session.call_tool(3, "git_status", serde_json::json!({}));
+    assert!(response.get("error").is_none(), "{response}");
+    let content = &response["result"]["structuredContent"];
+    assert!(
+        content["output"]
+            .as_str()
+            .unwrap()
+            .contains(" M tracked.txt"),
+        "{content}"
+    );
+    assert!(
+        content.get("workspace").is_none(),
+        "single-mode git_status must not carry provenance: {content}"
+    );
+
+    let response = session.call_tool(4, "git_diff", serde_json::json!({ "staged": false }));
+    assert!(response.get("error").is_none(), "{response}");
+    let content = &response["result"]["structuredContent"];
+    assert!(
+        content["diff"].as_str().unwrap().contains("+line CHANGED"),
+        "{content}"
+    );
+    assert!(
+        content.get("workspace").is_none(),
+        "single-mode git_diff must not carry provenance: {content}"
+    );
+
+    let (code, stderr) = session.shutdown();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+}
+
+#[test]
+fn single_mode_git_error_keeps_the_v01_absolute_root_presentation() {
+    // Outside a repository, the v0.1 error text names the canonical
+    // absolute workspace root — that presentation must not be changed
+    // merely to suit registry mode.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let mut session = McpSession::start(&[tmp.path().to_str().unwrap()]);
+    session.initialize();
+
+    let response = session.call_tool(3, "git_status", serde_json::json!({}));
+    let text = expect_tool_error(&response);
+    assert!(
+        text.contains("does not appear to be inside a Git working tree"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&root),
+        "v0.1 presentation keeps the canonical absolute root: {text}"
+    );
 
     let (code, stderr) = session.shutdown();
     assert_eq!(code, Some(0), "stderr: {stderr}");
@@ -542,15 +732,17 @@ fn registry_mode_advertises_discovery_and_read_tools() {
     assert_eq!(
         names,
         [
+            "git_diff",
+            "git_status",
             "list_files",
             "list_workspaces",
             "read_file",
             "search",
             "workspace_info"
         ],
-        "registry mode must advertise exactly the M3 discovery + read tools"
+        "registry mode must advertise exactly the M4 discovery + read + Git tools"
     );
-    for unavailable in ["apply_patch", "run_command", "git_status", "git_diff"] {
+    for unavailable in ["apply_patch", "run_command"] {
         assert!(
             !tools.iter().any(|t| t == unavailable),
             "unmigrated tool '{unavailable}' must not be advertised: {tools:?}"
@@ -565,6 +757,8 @@ fn registry_mode_advertises_discovery_and_read_tools() {
         (4, "read_file", vec!["path"]),
         (5, "search", vec!["query"]),
         (6, "workspace_info", vec![]),
+        (7, "git_status", vec![]),
+        (8, "git_diff", vec![]),
     ] {
         let schema = session.tool_schema(id, tool);
         let required: Vec<&str> = schema["required"]
@@ -598,7 +792,24 @@ fn registry_mode_advertises_discovery_and_read_tools() {
         assert_eq!(pattern, "^[a-z0-9][a-z0-9._-]{0,63}$");
     }
 
-    let list_schema = session.tool_schema(7, "list_workspaces");
+    // git_diff keeps every existing GitDiffArgs field available with its
+    // previous optional semantics.
+    let diff_schema = session.tool_schema(9, "git_diff");
+    let diff_required: Vec<&str> = diff_schema["required"]
+        .as_array()
+        .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        !diff_required.iter().any(|r| *r == "staged" || *r == "path"),
+        "git_diff staged/path must stay optional: {diff_schema}"
+    );
+    assert!(
+        diff_schema["properties"].get("staged").is_some()
+            && diff_schema["properties"].get("path").is_some(),
+        "git_diff must keep the staged and path properties: {diff_schema}"
+    );
+
+    let list_schema = session.tool_schema(10, "list_workspaces");
     assert!(
         list_schema
             .get("required")
@@ -837,22 +1048,24 @@ fn registry_direct_invocation_of_unavailable_tool_is_safe() {
     let mut session = McpSession::start(&["--workspace-config", cfg_path.to_str().unwrap()]);
     session.initialize();
 
-    // git_status is not advertised in registry mode (M3 migrates only the
-    // read tools) — but tools/list hiding is not the boundary. A direct
-    // call must fail cleanly inside the router: a protocol-level "tool not
-    // found" error, no panic, no workspace access, no default workspace,
-    // and the session must remain healthy afterwards.
-    let response = session.call_tool(3, "git_status", serde_json::json!({}));
-    let error = response
-        .get("error")
-        .unwrap_or_else(|| panic!("unavailable tool must be rejected: {response}"));
-    assert!(
-        error["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("tool not found"),
-        "unexpected rejection: {response}"
-    );
+    // apply_patch and run_command are not advertised in registry mode (M4
+    // migrates only the read-only Git tools) — but tools/list hiding is not
+    // the boundary. A direct call must fail cleanly inside the router: a
+    // protocol-level "tool not found" error, no panic, no workspace access,
+    // no default workspace, and the session must remain healthy afterwards.
+    for (id, unavailable) in (3u64..).zip(["apply_patch", "run_command"]) {
+        let response = session.call_tool(id, unavailable, serde_json::json!({}));
+        let error = response
+            .get("error")
+            .unwrap_or_else(|| panic!("unavailable tool must be rejected: {response}"));
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("tool not found"),
+            "unexpected rejection: {response}"
+        );
+    }
 
     // The server is still alive and serving after the rejected call.
     let response = session.call_tool(4, "list_workspaces", serde_json::json!({}));
@@ -1154,6 +1367,380 @@ fn registry_read_tools_unknown_workspace_is_bounded_then_healthy() {
         response["result"]["structuredContent"]["lines"][0],
         serde_json::json!("1: FROM_ALPHA")
     );
+
+    let (code, stderr) = session.shutdown();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(!stderr.contains("panic"), "{stderr}");
+}
+
+#[test]
+fn registry_git_tools_are_scoped_in_independent_repositories() {
+    let (tmp, cfg) = independent_repos_registry();
+    let alpha = tmp.path().join("alpha");
+    let beta = tmp.path().join("beta");
+    // One unstaged modification + one untracked file in alpha; one staged
+    // change in beta.
+    std::fs::write(alpha.join("alpha_tracked.txt"), "ALPHA_DIFF_MARK\n").unwrap();
+    std::fs::write(alpha.join("alpha_extra.txt"), "new\n").unwrap();
+    std::fs::write(beta.join("beta_tracked.txt"), "BETA_STAGED_MARK\n").unwrap();
+    git(&beta, &["add", "."]);
+
+    let mut session = McpSession::start(&["--workspace-config", cfg.to_str().unwrap()]);
+    session.initialize();
+    let mut outputs: Vec<String> = Vec::new();
+
+    // git_status(alpha): alpha's changes only.
+    let response = session.call_tool(3, "git_status", serde_json::json!({ "workspace": "alpha" }));
+    outputs.push(response.to_string());
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(
+        content["workspace"],
+        serde_json::json!("alpha"),
+        "{content}"
+    );
+    assert_eq!(content["truncated"], serde_json::json!(false));
+    let output = content["output"].as_str().unwrap();
+    assert!(
+        output.contains("?? alpha_extra.txt") && output.contains("alpha_tracked.txt"),
+        "alpha changes missing: {output}"
+    );
+    assert!(
+        !output.contains("beta_tracked.txt") && !output.contains("BETA_STAGED_MARK"),
+        "beta change leaked into alpha's status: {output}"
+    );
+
+    // git_status(beta): the inverse view.
+    let response = session.call_tool(4, "git_status", serde_json::json!({ "workspace": "beta" }));
+    outputs.push(response.to_string());
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["workspace"], serde_json::json!("beta"), "{content}");
+    let output = content["output"].as_str().unwrap();
+    assert!(
+        output.contains("beta_tracked.txt"),
+        "beta change missing: {output}"
+    );
+    assert!(
+        !output.contains("alpha_tracked.txt") && !output.contains("alpha_extra.txt"),
+        "alpha change leaked into beta's status: {output}"
+    );
+
+    // git_diff(alpha): unstaged by default, only alpha's hunks.
+    let response = session.call_tool(5, "git_diff", serde_json::json!({ "workspace": "alpha" }));
+    outputs.push(response.to_string());
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(
+        content["workspace"],
+        serde_json::json!("alpha"),
+        "{content}"
+    );
+    assert_eq!(content["staged"], serde_json::json!(false));
+    let diff = content["diff"].as_str().unwrap();
+    assert!(diff.contains("+ALPHA_DIFF_MARK"), "{diff}");
+    assert!(
+        !diff.contains("BETA"),
+        "beta content leaked into alpha's diff: {diff}"
+    );
+
+    // git_diff(beta): staged=false selects nothing; staged=true the staged
+    // hunk — the same selection single mode would make for this context.
+    let response = session.call_tool(
+        6,
+        "git_diff",
+        serde_json::json!({ "workspace": "beta", "staged": false }),
+    );
+    outputs.push(response.to_string());
+    assert!(
+        response["result"]["structuredContent"]["diff"]
+            .as_str()
+            .unwrap()
+            .trim()
+            .is_empty(),
+        "unstaged diff of beta must be empty"
+    );
+    let response = session.call_tool(
+        7,
+        "git_diff",
+        serde_json::json!({ "workspace": "beta", "staged": true }),
+    );
+    outputs.push(response.to_string());
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["workspace"], serde_json::json!("beta"), "{content}");
+    assert_eq!(content["staged"], serde_json::json!(true));
+    assert!(
+        content["diff"]
+            .as_str()
+            .unwrap()
+            .contains("+BETA_STAGED_MARK"),
+        "{content}"
+    );
+
+    // Logical provenance + workspace-relative paths only: no absolute roots
+    // anywhere in the protocol output.
+    let all = outputs.join("\n");
+    for root in [&alpha, &beta] {
+        let root = root.to_string_lossy().into_owned();
+        assert!(
+            !all.contains(root.trim_start_matches('/')),
+            "absolute root leaked into Git output: {root}"
+        );
+    }
+
+    let (code, stderr) = session.shutdown();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(!stderr.contains("panic"), "{stderr}");
+}
+
+#[test]
+fn registry_git_tools_do_not_leak_through_a_parent_repository() {
+    let (tmp, cfg) = parent_repo_registry();
+    let repo = tmp.path().join("repo");
+    let alpha = repo.join("alpha");
+    let beta = repo.join("beta");
+    // Both workspaces sit inside the same parent repository; each gets its
+    // own modification.
+    std::fs::write(alpha.join("alpha.txt"), "original\nALPHA_PARENT_MARK\n").unwrap();
+    std::fs::write(beta.join("beta.txt"), "original\nBETA_PARENT_MARK\n").unwrap();
+
+    let mut session = McpSession::start(&["--workspace-config", cfg.to_str().unwrap()]);
+    session.initialize();
+    let mut outputs: Vec<String> = Vec::new();
+
+    // git_status(alpha): only alpha's change is visible...
+    let response = session.call_tool(3, "git_status", serde_json::json!({ "workspace": "alpha" }));
+    outputs.push(response.to_string());
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(
+        content["workspace"],
+        serde_json::json!("alpha"),
+        "{content}"
+    );
+    let output = content["output"].as_str().unwrap();
+    assert!(
+        output.contains(" M alpha.txt"),
+        "selected change missing: {output}"
+    );
+    assert!(
+        !output.contains("beta.txt") && !output.contains("BETA_PARENT_MARK"),
+        "sibling change leaked through the parent repository: {output}"
+    );
+
+    // ...and the inverse view for beta.
+    let response = session.call_tool(4, "git_status", serde_json::json!({ "workspace": "beta" }));
+    outputs.push(response.to_string());
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["workspace"], serde_json::json!("beta"), "{content}");
+    let output = content["output"].as_str().unwrap();
+    assert!(
+        output.contains(" M beta.txt"),
+        "selected change missing: {output}"
+    );
+    assert!(
+        !output.contains("alpha.txt") && !output.contains("ALPHA_PARENT_MARK"),
+        "sibling change leaked through the parent repository: {output}"
+    );
+
+    // git_diff(alpha): only alpha's hunks, with headers workspace-relative —
+    // the same rendering single mode produces for a workspace nested inside
+    // a parent repository.
+    let response = session.call_tool(5, "git_diff", serde_json::json!({ "workspace": "alpha" }));
+    outputs.push(response.to_string());
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(
+        content["workspace"],
+        serde_json::json!("alpha"),
+        "{content}"
+    );
+    let diff = content["diff"].as_str().unwrap();
+    assert!(
+        diff.contains("--- a/alpha.txt") && diff.contains("+++ b/alpha.txt"),
+        "diff headers must be workspace-relative: {diff}"
+    );
+    assert!(diff.contains("+ALPHA_PARENT_MARK"), "{diff}");
+    assert!(
+        !diff.contains("beta.txt") && !diff.contains("BETA_PARENT_MARK"),
+        "sibling diff leaked through the parent repository: {diff}"
+    );
+
+    // git_diff(beta): the inverse view.
+    let response = session.call_tool(6, "git_diff", serde_json::json!({ "workspace": "beta" }));
+    outputs.push(response.to_string());
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["workspace"], serde_json::json!("beta"), "{content}");
+    let diff = content["diff"].as_str().unwrap();
+    assert!(
+        diff.contains("+++ b/beta.txt") && diff.contains("+BETA_PARENT_MARK"),
+        "{diff}"
+    );
+    assert!(
+        !diff.contains("alpha.txt") && !diff.contains("ALPHA_PARENT_MARK"),
+        "sibling diff leaked through the parent repository: {diff}"
+    );
+
+    // Neither the selected roots nor the parent repository root may appear
+    // anywhere in the protocol output (both workspace roots sit inside the
+    // repo directory, so checking the repo path covers all three).
+    let all = outputs.join("\n");
+    let repo_str = repo.to_string_lossy().into_owned();
+    assert!(
+        !all.contains(repo_str.trim_start_matches('/')),
+        "parent repository root leaked into Git output: {repo_str}"
+    );
+
+    let (code, stderr) = session.shutdown();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(!stderr.contains("panic"), "{stderr}");
+}
+
+#[test]
+fn registry_git_diff_path_filter_stays_inside_the_workspace() {
+    let (tmp, cfg) = independent_repos_registry();
+    let alpha = tmp.path().join("alpha");
+    std::fs::create_dir_all(alpha.join("src")).unwrap();
+    std::fs::write(alpha.join("src/a.rs"), "original\n").unwrap();
+    std::fs::write(alpha.join("src/b.rs"), "original\n").unwrap();
+    git(&alpha, &["add", "."]);
+    git(&alpha, &["commit", "-m", "add src"]);
+    std::fs::write(alpha.join("src/a.rs"), "MARK_A\n").unwrap();
+    std::fs::write(alpha.join("src/b.rs"), "MARK_B\n").unwrap();
+
+    let mut session = McpSession::start(&["--workspace-config", cfg.to_str().unwrap()]);
+    session.initialize();
+
+    // A workspace-relative path filters the diff to one file.
+    let response = session.call_tool(
+        3,
+        "git_diff",
+        serde_json::json!({ "workspace": "alpha", "path": "src/a.rs" }),
+    );
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(
+        content["workspace"],
+        serde_json::json!("alpha"),
+        "{content}"
+    );
+    assert_eq!(content["path"], serde_json::json!("src/a.rs"), "{content}");
+    let diff = content["diff"].as_str().unwrap();
+    assert!(diff.contains("+MARK_A"), "{diff}");
+    assert!(
+        !diff.contains("MARK_B") && !diff.contains("b.rs"),
+        "path filter leaked the other file: {diff}"
+    );
+
+    // A root-targeted path renders as "." under the registry contract and
+    // scopes the diff to the whole workspace.
+    let response = session.call_tool(
+        4,
+        "git_diff",
+        serde_json::json!({ "workspace": "alpha", "path": "." }),
+    );
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["path"], serde_json::json!("."), "{content}");
+    let diff = content["diff"].as_str().unwrap();
+    assert!(
+        diff.contains("+MARK_A") && diff.contains("+MARK_B"),
+        "{diff}"
+    );
+    let raw = response.to_string();
+    assert!(
+        !raw.contains(alpha.to_string_lossy().as_ref()),
+        "root-targeted diff must not expose the root: {raw}"
+    );
+
+    // A sibling-workspace pathspec is rejected before any git process runs,
+    // and the server stays healthy afterwards.
+    let response = session.call_tool(
+        5,
+        "git_diff",
+        serde_json::json!({ "workspace": "alpha", "path": "../beta/beta_tracked.txt" }),
+    );
+    let text = expect_tool_error(&response);
+    assert!(
+        text.contains("Invalid diff path") || text.contains("outside the configured workspace"),
+        "'{text}"
+    );
+    let response = session.call_tool(6, "list_workspaces", serde_json::json!({}));
+    assert!(response.get("error").is_none(), "{response}");
+
+    let (code, stderr) = session.shutdown();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(!stderr.contains("panic"), "{stderr}");
+}
+
+#[test]
+fn registry_git_errors_stay_clean_and_the_server_stays_healthy() {
+    let (tmp, cfg) = git_and_plain_registry();
+    let alpha = tmp.path().join("alpha");
+    let plain = tmp.path().join("plain");
+    let mut session = McpSession::start(&["--workspace-config", cfg.to_str().unwrap()]);
+    session.initialize();
+
+    // Non-repository workspace: the normal v0.1-style failure, but under
+    // the registry presentation the root renders as "." — neither the
+    // selected root nor any other configured root may appear.
+    let response = session.call_tool(3, "git_status", serde_json::json!({ "workspace": "plain" }));
+    let text = expect_tool_error(&response);
+    assert!(
+        text.contains("does not appear to be inside a Git working tree"),
+        "{text}"
+    );
+    assert!(
+        text.contains("'.'"),
+        "registry root rendering is '.': {text}"
+    );
+    assert!(
+        !text.contains(plain.to_string_lossy().as_ref())
+            && !text.contains(alpha.to_string_lossy().as_ref()),
+        "non-repository error must not expose roots: {text}"
+    );
+
+    let response = session.call_tool(4, "git_diff", serde_json::json!({ "workspace": "plain" }));
+    let text = expect_tool_error(&response);
+    assert!(
+        text.contains("does not appear to be inside a Git working tree"),
+        "{text}"
+    );
+    assert!(
+        !text.contains(plain.to_string_lossy().as_ref()),
+        "non-repository error must not expose roots: {text}"
+    );
+
+    // Unknown workspace: the bounded M2 error — no git discovery, no fallback.
+    let response = session.call_tool(
+        5,
+        "git_status",
+        serde_json::json!({ "workspace": "does-not-exist" }),
+    );
+    let text = expect_tool_error(&response);
+    assert!(
+        text.contains("Unknown workspace 'does-not-exist'")
+            && text.contains("Use list_workspaces to discover valid workspace IDs"),
+        "{text}"
+    );
+
+    // Malformed selectors fail the id grammar at the boundary.
+    for (i, bad) in ["../foo", "Nian-Vision"].iter().enumerate() {
+        let response = session.call_tool(
+            6 + i as u64,
+            "git_status",
+            serde_json::json!({ "workspace": bad }),
+        );
+        let text = expect_tool_error(&response);
+        assert!(
+            text.contains("invalid workspace id") && text.contains(bad),
+            "selector '{bad}' must fail the id grammar check: {text}"
+        );
+    }
+
+    // The server is still healthy: a valid git call and discovery both work.
+    std::fs::write(alpha.join("alpha_tracked.txt"), "MODIFIED\n").unwrap();
+    let response = session.call_tool(8, "git_status", serde_json::json!({ "workspace": "alpha" }));
+    assert!(response.get("error").is_none(), "{response}");
+    let output = response["result"]["structuredContent"]["output"]
+        .as_str()
+        .unwrap();
+    assert!(output.contains(" M alpha_tracked.txt"), "{output}");
+    let response = session.call_tool(9, "list_workspaces", serde_json::json!({}));
+    assert!(response.get("error").is_none(), "{response}");
 
     let (code, stderr) = session.shutdown();
     assert_eq!(code, Some(0), "stderr: {stderr}");
