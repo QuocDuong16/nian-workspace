@@ -1,9 +1,17 @@
 //! `search` — fast bounded text search with ripgrep-like semantics
 //! (spec section 7.4), built on the `grep` crate family.
+//!
+//! The search logic lives in the context-based [`search_for_context`] core
+//! shared by both server modes; the single-mode wrapper resolves the fixed
+//! workspace, and the registry-mode wrapper selects a workspace by logical
+//! [`WorkspaceId`] and attaches provenance to the response (v0.2 M3).
 
-use crate::config::AppState;
+use crate::config::{AppState, Limits};
 use crate::error::{ToolError, ToolResult};
+use crate::tools::discovery::{resolve_registry_workspace, with_workspace_provenance};
 use crate::tools::{is_generated_dir, is_vcs_metadata_dir};
+use crate::workspace::WorkspaceContext;
+use crate::workspace_id::WorkspaceId;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use rmcp::schemars;
@@ -125,9 +133,33 @@ impl Sink for CollectingSink<'_> {
     }
 }
 
+/// Registry-mode `search` input: the logical workspace selector plus the
+/// unchanged single-mode arguments, flattened into one MCP input schema.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RegistrySearchArgs {
+    /// Logical workspace ID to operate on — exactly one of the IDs reported by list_workspaces.
+    #[schemars(
+        description = "Logical workspace ID to operate on — exactly one of the IDs reported by list_workspaces, as configured by the operator at startup. Not a path."
+    )]
+    pub workspace: WorkspaceId,
+    #[serde(flatten)]
+    pub args: SearchArgs,
+}
+
+/// Single-workspace mode entry point (v0.1 behavior, unchanged).
 pub(crate) fn handle(state: &AppState, args: SearchArgs) -> ToolResult<serde_json::Value> {
-    let ws = state.workspace();
-    let limits = state.limits();
+    search_for_context(state.single_workspace(), state.limits(), args)
+}
+
+/// Context-based core shared by both server modes: identical matcher,
+/// visibility, bounding, and workspace-relative path behavior, rooted at
+/// the selected context's hardened resolver.
+pub(crate) fn search_for_context(
+    ctx: &WorkspaceContext,
+    limits: &Limits,
+    args: SearchArgs,
+) -> ToolResult<serde_json::Value> {
+    let ws = ctx.resolver();
 
     if args.query.trim().is_empty() {
         return Err(ToolError::msg("Search query must not be empty."));
@@ -287,6 +319,18 @@ pub(crate) fn handle(state: &AppState, args: SearchArgs) -> ToolResult<serde_jso
         "truncated": truncated,
         "matches": results,
     }))
+}
+
+/// Registry-mode `search`: exact [`WorkspaceId`] lookup, the shared
+/// context-based core, then logical workspace provenance in the response.
+pub(crate) fn registry_search(
+    state: &AppState,
+    args: RegistrySearchArgs,
+) -> ToolResult<serde_json::Value> {
+    let RegistrySearchArgs { workspace, args } = args;
+    let ctx = resolve_registry_workspace(state, &workspace)?;
+    let value = search_for_context(&ctx, state.limits(), args)?;
+    Ok(with_workspace_provenance(value, &workspace))
 }
 
 #[cfg(test)]
@@ -659,5 +703,108 @@ mod tests {
                 "'{attempt}' must be treated as VCS metadata, got: {err}"
             );
         }
+    }
+
+    // -- registry-mode wrapper (v0.2 M3) --------------------------------------
+
+    /// Two-workspace registry with distinct marker tokens per workspace.
+    fn registry_fixture() -> (TempDir, AppState) {
+        let tmp = TempDir::new().unwrap();
+        let alpha = tmp.path().join("alpha");
+        let beta = tmp.path().join("beta");
+        std::fs::create_dir_all(alpha.join("src")).unwrap();
+        std::fs::create_dir_all(beta.join("src")).unwrap();
+        std::fs::write(alpha.join("src/a.rs"), b"UNIQUE_ALPHA_TOKEN\n").unwrap();
+        std::fs::write(beta.join("src/b.rs"), b"UNIQUE_BETA_TOKEN\n").unwrap();
+        let config = format!(
+            "version = 1\n\n[workspaces.alpha]\nroot = '{}'\n\n[workspaces.beta]\nroot = '{}'\n",
+            alpha.display(),
+            beta.display()
+        );
+        let registry = crate::registry::WorkspaceRegistry::from_toml_str(&config).unwrap();
+        (tmp, AppState::from_registry(registry))
+    }
+
+    #[test]
+    fn registry_search_selects_requested_workspace_with_provenance() {
+        let (_tmp, state) = registry_fixture();
+        for (name, expected_path, other_token) in [
+            ("alpha", "src/a.rs", "UNIQUE_BETA_TOKEN"),
+            ("beta", "src/b.rs", "UNIQUE_ALPHA_TOKEN"),
+        ] {
+            let out = registry_search(
+                &state,
+                RegistrySearchArgs {
+                    workspace: WorkspaceId::parse(name).unwrap(),
+                    args: SearchArgs {
+                        query: "UNIQUE_".into(),
+                        path: None,
+                        glob: None,
+                        ignore_case: false,
+                        literal: false,
+                        max_results: None,
+                    },
+                },
+            )
+            .unwrap();
+            assert_eq!(out["workspace"], json!(name), "logical provenance");
+            assert_eq!(out["match_count"], json!(1));
+            assert_eq!(out["matches"][0]["path"], json!(expected_path));
+            let rendered = out.to_string();
+            assert!(
+                !rendered.contains(other_token),
+                "search must not bleed across workspaces: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_search_rejects_traversal_into_sibling_workspace() {
+        let (_tmp, state) = registry_fixture();
+        let err = registry_search(
+            &state,
+            RegistrySearchArgs {
+                workspace: WorkspaceId::parse("alpha").unwrap(),
+                args: SearchArgs {
+                    query: "TOKEN".into(),
+                    path: Some("../beta".into()),
+                    glob: None,
+                    ignore_case: false,
+                    literal: false,
+                    max_results: None,
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("outside the configured workspace"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_search_rejects_symlink_escape_into_sibling_workspace() {
+        let (tmp, state) = registry_fixture();
+        std::os::unix::fs::symlink("../beta", tmp.path().join("alpha/leak")).unwrap();
+        let err = registry_search(
+            &state,
+            RegistrySearchArgs {
+                workspace: WorkspaceId::parse("alpha").unwrap(),
+                args: SearchArgs {
+                    query: "TOKEN".into(),
+                    path: Some("leak".into()),
+                    glob: None,
+                    ignore_case: false,
+                    literal: false,
+                    max_results: None,
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("outside the configured workspace"),
+            "{err}"
+        );
     }
 }

@@ -1,18 +1,23 @@
 //! Registry-mode discovery tools (v0.2 M2): `list_workspaces` and the
-//! workspace-selecting `workspace_info`.
+//! workspace-selecting `workspace_info`, plus the routing helpers every
+//! registry-mode tool shares.
 //!
-//! These are the only tools the registry-mode server exposes. Discovery is
-//! read-only and entirely startup-configured: there is no runtime
-//! registration, workspace switching, aliasing, or path-based selection.
-//! Absolute roots and configuration paths are never reported — clients see
-//! logical ids and effective permissions only.
+//! These are the only pieces of registry routing: a validated logical
+//! [`WorkspaceId`] goes through [`resolve_registry_workspace`] — one exact
+//! lookup into the immutable registry — into the selected
+//! [`WorkspaceContext`]. There is no runtime registration, workspace
+//! switching, aliasing, or path-based selection, and no default or fallback
+//! workspace. Absolute roots and configuration paths are never reported —
+//! clients see logical ids and effective permissions only.
 
 use crate::config::AppState;
 use crate::error::{ToolError, ToolResult};
 use crate::tools::workspace_info::{self, WorkspaceIdentity};
+use crate::workspace::WorkspaceContext;
 use crate::workspace_id::WorkspaceId;
 use rmcp::schemars;
 use serde_json::json;
+use std::sync::Arc;
 
 /// Input schema for registry-mode `workspace_info`: one required logical
 /// workspace selector. Deserialization goes through
@@ -53,18 +58,42 @@ pub(crate) fn workspace_info(
     state: &AppState,
     args: WorkspaceInfoArgs,
 ) -> ToolResult<serde_json::Value> {
-    let ctx = state
-        .registry()
-        .get(&args.workspace)
-        .ok_or_else(|| unknown_workspace(&args.workspace))?;
+    let ctx = resolve_registry_workspace(state, &args.workspace)?;
     workspace_info::describe(&ctx, WorkspaceIdentity::Logical(&args.workspace))
+}
+
+/// The one routing step every registry-mode filesystem tool shares: exact
+/// logical-id lookup into the immutable registry. Unknown ids produce the
+/// fixed, bounded error below — no enumeration, no fallback, no default,
+/// and no filesystem access of any kind.
+pub(crate) fn resolve_registry_workspace(
+    state: &AppState,
+    id: &WorkspaceId,
+) -> ToolResult<Arc<WorkspaceContext>> {
+    state
+        .registry()
+        .get(id)
+        .ok_or_else(|| unknown_workspace(id))
+}
+
+/// Attach logical workspace provenance to a registry-mode response so a
+/// client operating across several workspaces can tell results apart.
+/// One top-level field; per-entry/per-match duplication is avoided.
+pub(crate) fn with_workspace_provenance(
+    mut value: serde_json::Value,
+    id: &WorkspaceId,
+) -> serde_json::Value {
+    if let Some(object) = value.as_object_mut() {
+        object.insert("workspace".to_string(), json!(id.as_str()));
+    }
+    value
 }
 
 /// Unknown ids are rejected explicitly with a fixed-size, bounded message.
 /// The configured ids are deliberately not enumerated — discovery output and
 /// error text must both stay bounded regardless of registry size, and
 /// `list_workspaces` is the authoritative, paginated-free way to recover.
-fn unknown_workspace(requested: &WorkspaceId) -> ToolError {
+pub(crate) fn unknown_workspace(requested: &WorkspaceId) -> ToolError {
     ToolError::msg(format!(
         "Unknown workspace '{}'. Use list_workspaces to discover valid workspace IDs.",
         requested
@@ -260,5 +289,31 @@ mod tests {
         // requested id.
         assert_eq!(first["workspace"], json!("alpha"));
         assert_eq!(second["workspace"], json!("beta"));
+    }
+
+    #[test]
+    fn resolve_registry_workspace_is_exact_and_bounded_on_unknown() {
+        let (tmp, state) = registry_state(&["beta", "alpha"]);
+
+        let ctx = resolve_registry_workspace(&state, &WorkspaceId::parse("alpha").unwrap())
+            .expect("registered id resolves");
+        assert_eq!(ctx.id().unwrap().as_str(), "alpha");
+
+        let err =
+            resolve_registry_workspace(&state, &WorkspaceId::parse("does-not-exist").unwrap())
+                .expect_err("unknown id must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("Unknown workspace 'does-not-exist'"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("alpha") && !message.contains("beta"),
+            "the bounded error must not enumerate configured ids: {message}"
+        );
+        assert!(
+            !message.contains(tmp.path().to_string_lossy().as_ref()),
+            "errors must not expose filesystem roots: {message}"
+        );
     }
 }

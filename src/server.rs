@@ -1,12 +1,13 @@
-//! Mode-aware MCP server boundary (v0.2 M2).
+//! Mode-aware MCP server boundary (v0.2 M2/M3).
 //!
 //! There are two separate MCP servers, each with its own tool router, and
 //! each transport selects exactly one from [`RuntimeMode`] at startup:
 //!
 //! - [`NianWorkspaceServer`] (single-workspace mode): the complete,
 //!   unchanged v0.1 tool surface, rooted at the one configured workspace.
-//! - [`RegistryServer`] (registry mode): discovery only — `list_workspaces`
-//!   and a workspace-selecting `workspace_info`.
+//! - [`RegistryServer`] (registry mode): workspace discovery plus read-only
+//!   filesystem access — `list_workspaces`, `workspace_info`, and
+//!   workspace-selecting `list_files`, `read_file`, and `search`.
 //!
 //! This is genuine mode-specific routing, not cosmetic hiding: a tool that
 //! is not available in a mode is not registered on that mode's router at
@@ -16,9 +17,12 @@
 //! without any default-workspace fallback. The server stays fully usable
 //! afterwards.
 //!
-//! The intended longer-term shape (M3+): migrate scoped tools onto
-//! `WorkspaceContext` one group at a time and register them on the
-//! registry-mode router as they become workspace-id aware.
+//! Registry filesystem tools share the single-mode implementations through
+//! context-based cores: mode selection happens at this server boundary,
+//! workspace selection inside the registry wrappers, and filesystem
+//! behavior in the shared `*_for_context` functions over the selected
+//! [`WorkspaceContext`] (v0.2 M3). Later milestones migrate further scoped
+//! tool groups the same way, one group at a time.
 
 mod registry;
 mod single;

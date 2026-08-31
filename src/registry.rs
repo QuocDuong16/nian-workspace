@@ -31,7 +31,7 @@
 //! 10. `allow_shell = true` requires `exec = true`;
 //! 11. unknown/malformed fields fail via strict TOML deserialization.
 //!
-//! Rules 7 and 8 use **filesystem identity**, never path strings or string
+//! Rules 8 and 9 use **filesystem identity**, never path strings or string
 //! case folding: the OS reports whether two paths denote the same directory
 //! (device + inode on Unix, volume serial + file index on Windows). Two
 //! genuinely distinct directories therefore never collide, even when their

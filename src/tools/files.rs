@@ -1,8 +1,17 @@
 //! `list_files` and `read_file` (spec sections 7.2 / 7.3).
+//!
+//! The filesystem logic lives in context-based cores
+//! ([`list_files_for_context`] / [`read_file_for_context`]) shared by both
+//! server modes; the single-mode wrappers resolve the fixed workspace, and
+//! the registry-mode wrappers select a workspace by logical
+//! [`WorkspaceId`] and attach provenance to the response (v0.2 M3).
 
-use crate::config::AppState;
+use crate::config::{AppState, Limits};
 use crate::error::{ToolError, ToolResult};
+use crate::tools::discovery::{resolve_registry_workspace, with_workspace_provenance};
 use crate::tools::{clip_line, is_generated_or_vcs_dir};
+use crate::workspace::WorkspaceContext;
+use crate::workspace_id::WorkspaceId;
 use rmcp::schemars;
 use serde_json::json;
 use std::io::{BufRead, Read, Seek, SeekFrom};
@@ -40,9 +49,33 @@ pub struct ListFilesArgs {
     pub glob: Option<String>,
 }
 
+/// Registry-mode `list_files` input: the logical workspace selector plus the
+/// unchanged single-mode arguments, flattened into one MCP input schema
+/// (no nested `args` object).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RegistryListFilesArgs {
+    /// Logical workspace ID to operate on — exactly one of the IDs reported by list_workspaces.
+    #[schemars(
+        description = "Logical workspace ID to operate on — exactly one of the IDs reported by list_workspaces, as configured by the operator at startup. Not a path."
+    )]
+    pub workspace: WorkspaceId,
+    #[serde(flatten)]
+    pub args: ListFilesArgs,
+}
+
+/// Single-workspace mode entry point (v0.1 behavior, unchanged).
 pub(crate) fn list_files(state: &AppState, args: ListFilesArgs) -> ToolResult<serde_json::Value> {
-    let ws = state.workspace();
-    let limits = state.limits();
+    list_files_for_context(state.single_workspace(), state.limits(), args)
+}
+
+/// Context-based core shared by both server modes. All filesystem behavior
+/// goes through the context's hardened resolver; `limits` bounds the output.
+pub(crate) fn list_files_for_context(
+    ctx: &WorkspaceContext,
+    limits: &Limits,
+    args: ListFilesArgs,
+) -> ToolResult<serde_json::Value> {
+    let ws = ctx.resolver();
 
     let dir = ws.resolve(args.path.as_deref())?;
     if !dir.exists() {
@@ -139,6 +172,18 @@ pub(crate) fn list_files(state: &AppState, args: ListFilesArgs) -> ToolResult<se
     }))
 }
 
+/// Registry-mode `list_files`: exact [`WorkspaceId`] lookup, the shared
+/// context-based core, then logical workspace provenance in the response.
+pub(crate) fn registry_list_files(
+    state: &AppState,
+    args: RegistryListFilesArgs,
+) -> ToolResult<serde_json::Value> {
+    let RegistryListFilesArgs { workspace, args } = args;
+    let ctx = resolve_registry_workspace(state, &workspace)?;
+    let value = list_files_for_context(&ctx, state.limits(), args)?;
+    Ok(with_workspace_provenance(value, &workspace))
+}
+
 /// Shared visibility rule for listing/pruning: hide dot-entries unless asked,
 /// and prune generated/VCS directories entirely.
 fn entry_is_visible(entry: &walkdir::DirEntry, include_hidden: bool) -> bool {
@@ -183,9 +228,33 @@ struct EmittedLine {
     text: String,
 }
 
+/// Registry-mode `read_file` input: the logical workspace selector plus the
+/// unchanged single-mode arguments, flattened into one MCP input schema.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RegistryReadFileArgs {
+    /// Logical workspace ID to operate on — exactly one of the IDs reported by list_workspaces.
+    #[schemars(
+        description = "Logical workspace ID to operate on — exactly one of the IDs reported by list_workspaces, as configured by the operator at startup. Not a path."
+    )]
+    pub workspace: WorkspaceId,
+    #[serde(flatten)]
+    pub args: ReadFileArgs,
+}
+
+/// Single-workspace mode entry point (v0.1 behavior, unchanged).
 pub(crate) fn read_file(state: &AppState, args: ReadFileArgs) -> ToolResult<serde_json::Value> {
-    let ws = state.workspace();
-    let limits = state.limits();
+    read_file_for_context(state.single_workspace(), state.limits(), args)
+}
+
+/// Context-based core shared by both server modes: identical UTF-8/binary,
+/// line-number, range, and bounded-memory behavior, rooted at the selected
+/// context's hardened resolver.
+pub(crate) fn read_file_for_context(
+    ctx: &WorkspaceContext,
+    limits: &Limits,
+    args: ReadFileArgs,
+) -> ToolResult<serde_json::Value> {
+    let ws = ctx.resolver();
 
     let path: PathBuf = ws.resolve(Some(args.path.as_str()))?;
     let meta = std::fs::metadata(&path).map_err(|e| {
@@ -325,6 +394,18 @@ pub(crate) fn read_file(state: &AppState, args: ReadFileArgs) -> ToolResult<serd
 fn number_prefix_len(n: u64) -> usize {
     let digits = n.to_string().len();
     digits + 2 // ": "
+}
+
+/// Registry-mode `read_file`: exact [`WorkspaceId`] lookup, the shared
+/// context-based core, then logical workspace provenance in the response.
+pub(crate) fn registry_read_file(
+    state: &AppState,
+    args: RegistryReadFileArgs,
+) -> ToolResult<serde_json::Value> {
+    let RegistryReadFileArgs { workspace, args } = args;
+    let ctx = resolve_registry_workspace(state, &workspace)?;
+    let value = read_file_for_context(&ctx, state.limits(), args)?;
+    Ok(with_workspace_provenance(value, &workspace))
 }
 
 fn read_at_most(file: &mut impl Read, buf: &mut [u8]) -> ToolResult<usize> {
@@ -684,5 +765,209 @@ mod tests {
             .collect();
         assert!(paths.contains(&"src/a.rs"));
         assert!(!paths.contains(&"src/b.txt"));
+    }
+
+    // -- registry-mode wrappers (v0.2 M3) ------------------------------------
+
+    /// Two-workspace registry with same-named but distinct files, so any
+    /// cross-workspace bleed shows up as wrong content or wrong structure.
+    fn registry_fixture() -> (TempDir, AppState) {
+        let tmp = TempDir::new().unwrap();
+        let alpha = tmp.path().join("alpha");
+        let beta = tmp.path().join("beta");
+        std::fs::create_dir_all(alpha.join("src")).unwrap();
+        std::fs::create_dir_all(beta.join("src")).unwrap();
+        std::fs::write(alpha.join("shared.txt"), b"FROM_ALPHA\n").unwrap();
+        std::fs::write(beta.join("shared.txt"), b"FROM_BETA\n").unwrap();
+        std::fs::write(alpha.join("src/main.rs"), b"ALPHA_MARKER\n").unwrap();
+        std::fs::write(beta.join("src/main.rs"), b"BETA_MARKER\n").unwrap();
+        std::fs::write(beta.join("src/only_beta.rs"), b"ONLY_BETA\n").unwrap();
+        let config = format!(
+            "version = 1\n\n[workspaces.alpha]\nroot = '{}'\n\n[workspaces.beta]\nroot = '{}'\n",
+            alpha.display(),
+            beta.display()
+        );
+        let registry = crate::registry::WorkspaceRegistry::from_toml_str(&config).unwrap();
+        (tmp, AppState::from_registry(registry))
+    }
+
+    fn reg_id(name: &str) -> WorkspaceId {
+        WorkspaceId::parse(name).unwrap()
+    }
+
+    #[test]
+    fn registry_read_file_selects_requested_workspace_with_provenance() {
+        let (_tmp, state) = registry_fixture();
+        for (name, expected_line) in [("alpha", "1: FROM_ALPHA"), ("beta", "1: FROM_BETA")] {
+            let out = registry_read_file(
+                &state,
+                RegistryReadFileArgs {
+                    workspace: reg_id(name),
+                    args: ReadFileArgs {
+                        path: "shared.txt".into(),
+                        start_line: None,
+                        end_line: None,
+                    },
+                },
+            )
+            .unwrap();
+            assert_eq!(out["workspace"], json!(name), "logical provenance");
+            assert_eq!(
+                out["lines"][0],
+                json!(expected_line),
+                "no cross-workspace bleed"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_read_file_rejects_traversal_into_sibling_workspace() {
+        let (_tmp, state) = registry_fixture();
+        let err = registry_read_file(
+            &state,
+            RegistryReadFileArgs {
+                workspace: reg_id("alpha"),
+                args: ReadFileArgs {
+                    path: "../beta/shared.txt".into(),
+                    start_line: None,
+                    end_line: None,
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("outside the configured workspace"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_read_file_rejects_symlink_escape_into_sibling_workspace() {
+        let (tmp, state) = registry_fixture();
+        std::os::unix::fs::symlink("../beta", tmp.path().join("alpha/leak")).unwrap();
+        let err = registry_read_file(
+            &state,
+            RegistryReadFileArgs {
+                workspace: reg_id("alpha"),
+                args: ReadFileArgs {
+                    path: "leak/shared.txt".into(),
+                    start_line: None,
+                    end_line: None,
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("outside the configured workspace"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn registry_list_files_selects_requested_workspace_with_provenance() {
+        let (_tmp, state) = registry_fixture();
+        let list = |name: &str| {
+            registry_list_files(
+                &state,
+                RegistryListFilesArgs {
+                    workspace: reg_id(name),
+                    args: ListFilesArgs {
+                        path: Some("src".into()),
+                        depth: Some(2),
+                        include_hidden: false,
+                        glob: None,
+                    },
+                },
+            )
+            .unwrap()
+        };
+
+        // alpha/src holds only main.rs; beta/src also holds only_beta.rs —
+        // identical relative paths must not cross-select.
+        let out = list("alpha");
+        assert_eq!(out["workspace"], json!("alpha"));
+        let paths: Vec<&str> = out["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, ["src/main.rs"]);
+
+        let out = list("beta");
+        let mut paths: Vec<&str> = out["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["src/main.rs", "src/only_beta.rs"]);
+    }
+
+    #[test]
+    fn registry_list_files_rejects_traversal_into_sibling_workspace() {
+        let (_tmp, state) = registry_fixture();
+        let err = registry_list_files(
+            &state,
+            RegistryListFilesArgs {
+                workspace: reg_id("alpha"),
+                args: ListFilesArgs {
+                    path: Some("../beta".into()),
+                    depth: None,
+                    include_hidden: false,
+                    glob: None,
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("outside the configured workspace"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn registry_file_tools_route_unknown_workspaces_through_bounded_error() {
+        let (_tmp, state) = registry_fixture();
+        let bad = reg_id("does-not-exist");
+
+        let err = registry_read_file(
+            &state,
+            RegistryReadFileArgs {
+                workspace: bad.clone(),
+                args: ReadFileArgs {
+                    path: "shared.txt".into(),
+                    start_line: None,
+                    end_line: None,
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Unknown workspace 'does-not-exist'"),
+            "{err}"
+        );
+
+        let err = registry_list_files(
+            &state,
+            RegistryListFilesArgs {
+                workspace: bad,
+                args: ListFilesArgs {
+                    path: None,
+                    depth: None,
+                    include_hidden: false,
+                    glob: None,
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Unknown workspace 'does-not-exist'"),
+            "{err}"
+        );
     }
 }

@@ -48,9 +48,14 @@ impl Workspace {
     }
 
     /// Render `path` relative to the workspace root for display purposes.
+    ///
+    /// The workspace root itself renders as `"."` so that responses rooted
+    /// at the workspace carry a workspace-relative path instead of leaking
+    /// the absolute root (registry-mode clients must never see it).
     pub fn display_relative(&self, path: &Path) -> String {
         match path.strip_prefix(&self.root_canonical) {
             Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().into_owned(),
+            Ok(_) => ".".to_string(),
             _ => path.to_string_lossy().into_owned(),
         }
     }
@@ -454,5 +459,14 @@ mod tests {
         let (_tmp, ws) = make_workspace(&["src/main.rs"]);
         let p = ws.resolve(Some("src/main.rs")).unwrap();
         assert_eq!(ws.display_relative(&p), "src/main.rs");
+    }
+
+    #[test]
+    fn display_relative_renders_the_workspace_root_as_dot() {
+        let (_tmp, ws) = make_workspace(&["src/main.rs"]);
+        // The workspace root must never be rendered as an absolute path:
+        // registry-mode responses are rooted at it.
+        assert_eq!(ws.display_relative(ws.root()), ".");
+        assert_eq!(ws.display_relative(&ws.root().join("src")), "src");
     }
 }

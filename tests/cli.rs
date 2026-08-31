@@ -308,6 +308,31 @@ fn two_workspace_config(tmp: &TempDir) -> (TempDir, PathBuf) {
     write_config(&config)
 }
 
+/// Two-workspace registry (alpha/beta) with same-named but distinct files,
+/// so any cross-workspace bleed shows up as wrong content or structure.
+fn cross_workspace_registry() -> (TempDir, PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let alpha = tmp.path().join("alpha");
+    let beta = tmp.path().join("beta");
+    std::fs::create_dir_all(alpha.join("src")).unwrap();
+    std::fs::create_dir_all(beta.join("src")).unwrap();
+    std::fs::write(alpha.join("shared.txt"), b"FROM_ALPHA\n").unwrap();
+    std::fs::write(beta.join("shared.txt"), b"FROM_BETA\n").unwrap();
+    std::fs::write(alpha.join("src/a.rs"), b"UNIQUE_ALPHA_TOKEN\n").unwrap();
+    std::fs::write(beta.join("src/b.rs"), b"UNIQUE_BETA_TOKEN\n").unwrap();
+    std::fs::write(beta.join("src/only_beta.rs"), b"ONLY_BETA\n").unwrap();
+    let config = registry_config(
+        "version = 1",
+        &[
+            workspace_entry("alpha", &alpha, ""),
+            workspace_entry("beta", &beta, ""),
+        ],
+    );
+    let path = tmp.path().join("workspaces.toml");
+    std::fs::write(&path, config).unwrap();
+    (tmp, path)
+}
+
 #[test]
 fn single_mode_tools_list_is_exactly_the_v01_surface() {
     let tmp = TempDir::new().unwrap();
@@ -341,6 +366,26 @@ fn single_mode_tools_list_is_exactly_the_v01_surface() {
         content.get("name").is_some(),
         "v0.1 response shape: {content}"
     );
+
+    // M3 must not have grown a workspace selector on the single-mode read
+    // tools: their advertised schemas keep the exact v0.1 shape.
+    for (id, tool) in (10..).zip(["list_files", "read_file", "search"]) {
+        let schema = session.tool_schema(id, tool);
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !required.iter().any(|r| r == "workspace"),
+            "single-mode {tool} must not require workspace: {schema}"
+        );
+        assert!(
+            schema["properties"].get("workspace").is_none(),
+            "single-mode {tool} must not have a workspace property: {schema}"
+        );
+    }
+    // And the v0.1 calls still succeed without any selector.
+    let response = session.call_tool(20, "list_files", serde_json::json!({}));
+    assert!(response.get("error").is_none(), "{response}");
+    let response = session.call_tool(21, "search", serde_json::json!({ "query": "anything" }));
+    assert!(response.get("error").is_none(), "{response}");
 
     let (code, stderr) = session.shutdown();
     assert_eq!(code, Some(0), "stderr: {stderr}");
@@ -381,7 +426,7 @@ fn registry_mode_serves_mcp_after_valid_config() {
 }
 
 #[test]
-fn registry_mode_advertises_only_discovery_tools() {
+fn registry_mode_advertises_discovery_and_read_tools() {
     let tmp = TempDir::new().unwrap();
     let (_cfg_dir, cfg_path) = two_workspace_config(&tmp);
     let mut session = McpSession::start(&["--workspace-config", cfg_path.to_str().unwrap()]);
@@ -392,38 +437,64 @@ fn registry_mode_advertises_only_discovery_tools() {
     names.sort();
     assert_eq!(
         names,
-        ["list_workspaces", "workspace_info"],
-        "registry mode must advertise exactly the M2 discovery tools"
+        [
+            "list_files",
+            "list_workspaces",
+            "read_file",
+            "search",
+            "workspace_info"
+        ],
+        "registry mode must advertise exactly the M3 discovery + read tools"
     );
-    for unavailable in [
-        "list_files",
-        "read_file",
-        "search",
-        "apply_patch",
-        "run_command",
-        "git_status",
-        "git_diff",
-    ] {
+    for unavailable in ["apply_patch", "run_command", "git_status", "git_diff"] {
         assert!(
             !tools.iter().any(|t| t == unavailable),
             "unmigrated tool '{unavailable}' must not be advertised: {tools:?}"
         );
     }
 
-    // Registry workspace_info requires the logical selector; list_workspaces
-    // takes no arguments.
-    let schema = session.tool_schema(3, "workspace_info");
-    let required: Vec<&str> = schema["required"]
-        .as_array()
-        .expect("required array")
-        .iter()
-        .map(|v| v.as_str().expect("required entry string"))
-        .collect();
-    assert!(
-        required.contains(&"workspace"),
-        "registry workspace_info must require 'workspace': {schema}"
-    );
-    let list_schema = session.tool_schema(4, "list_workspaces");
+    // Every selector tool requires the logical workspace id; list_workspaces
+    // takes no arguments. The selector schema uses the WorkspaceId grammar
+    // (inlined or via $defs/$ref, as schemars renders it).
+    for (id, tool, also_required) in [
+        (3u64, "list_files", vec![]),
+        (4, "read_file", vec!["path"]),
+        (5, "search", vec!["query"]),
+        (6, "workspace_info", vec![]),
+    ] {
+        let schema = session.tool_schema(id, tool);
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .map(|v| v.as_str().expect("required entry string"))
+            .collect();
+        assert!(
+            required.contains(&"workspace"),
+            "registry {tool} must require 'workspace': {schema}"
+        );
+        for extra in also_required {
+            assert!(
+                required.contains(&extra),
+                "registry {tool} must still require '{extra}': {schema}"
+            );
+        }
+        // The schema must stay flat: workspace sits beside the existing
+        // fields, never nested under an "args" object.
+        assert!(
+            schema["properties"].get("workspace").is_some(),
+            "registry {tool} schema must have a flat workspace property: {schema}"
+        );
+        assert!(
+            schema["properties"].get("args").is_none(),
+            "registry {tool} schema must not nest arguments: {schema}"
+        );
+        let pattern = workspace_selector_pattern(&schema)
+            .expect("workspace selector must use the WorkspaceId pattern");
+        assert_eq!(pattern, "^[a-z0-9][a-z0-9._-]{0,63}$");
+    }
+
+    let list_schema = session.tool_schema(7, "list_workspaces");
     assert!(
         list_schema
             .get("required")
@@ -434,6 +505,20 @@ fn registry_mode_advertises_only_discovery_tools() {
 
     let (code, stderr) = session.shutdown();
     assert_eq!(code, Some(0), "stderr: {stderr}");
+}
+
+/// Resolve the JSON-schema pattern of a tool's `workspace` property,
+/// following a `$defs/$ref` indirection when schemars emits one.
+fn workspace_selector_pattern(tool_schema: &serde_json::Value) -> Option<String> {
+    let property = &tool_schema["properties"]["workspace"];
+    if let Some(pattern) = property.get("pattern").and_then(|p| p.as_str()) {
+        return Some(pattern.to_string());
+    }
+    let reference = property.get("$ref").and_then(|r| r.as_str())?;
+    let name = reference.rsplit('/').next()?;
+    tool_schema["$defs"][name]["pattern"]
+        .as_str()
+        .map(|p| p.to_string())
 }
 
 #[test]
@@ -648,12 +733,12 @@ fn registry_direct_invocation_of_unavailable_tool_is_safe() {
     let mut session = McpSession::start(&["--workspace-config", cfg_path.to_str().unwrap()]);
     session.initialize();
 
-    // read_file is not advertised in registry mode — but tools/list hiding
-    // is not the boundary. A direct call must fail cleanly inside the
-    // router: a protocol-level "tool not found" error, no panic, no
-    // workspace access, no default workspace, and the session must remain
-    // healthy afterwards.
-    let response = session.call_tool(3, "read_file", serde_json::json!({ "path": "secret.txt" }));
+    // git_status is not advertised in registry mode (M3 migrates only the
+    // read tools) — but tools/list hiding is not the boundary. A direct
+    // call must fail cleanly inside the router: a protocol-level "tool not
+    // found" error, no panic, no workspace access, no default workspace,
+    // and the session must remain healthy afterwards.
+    let response = session.call_tool(3, "git_status", serde_json::json!({}));
     let error = response
         .get("error")
         .unwrap_or_else(|| panic!("unavailable tool must be rejected: {response}"));
@@ -669,6 +754,302 @@ fn registry_direct_invocation_of_unavailable_tool_is_safe() {
     let response = session.call_tool(4, "list_workspaces", serde_json::json!({}));
     assert!(response.get("error").is_none(), "{response}");
     assert!(response["result"]["structuredContent"]["workspaces"].is_array());
+
+    let (code, stderr) = session.shutdown();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(!stderr.contains("panic"), "{stderr}");
+}
+
+#[test]
+fn registry_read_tools_isolate_workspaces_and_carry_provenance() {
+    let (tmp, cfg) = cross_workspace_registry();
+    let alpha_root = tmp.path().join("alpha");
+    let beta_root = tmp.path().join("beta");
+    let mut session = McpSession::start(&["--workspace-config", cfg.to_str().unwrap()]);
+    session.initialize();
+
+    let mut protocol_output: Vec<String> = Vec::new();
+
+    // read_file: identical relative filename, different content per root —
+    // no bleed in either direction.
+    let response = session.call_tool(
+        3,
+        "read_file",
+        serde_json::json!({ "workspace": "alpha", "path": "shared.txt" }),
+    );
+    protocol_output.push(response.to_string());
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(
+        content["workspace"],
+        serde_json::json!("alpha"),
+        "{content}"
+    );
+    assert_eq!(content["lines"][0], serde_json::json!("1: FROM_ALPHA"));
+
+    let response = session.call_tool(
+        4,
+        "read_file",
+        serde_json::json!({ "workspace": "beta", "path": "shared.txt" }),
+    );
+    protocol_output.push(response.to_string());
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["workspace"], serde_json::json!("beta"), "{content}");
+    assert_eq!(content["lines"][0], serde_json::json!("1: FROM_BETA"));
+
+    // list_files: different directory structures per root.
+    let response = session.call_tool(
+        5,
+        "list_files",
+        serde_json::json!({ "workspace": "alpha", "path": "src" }),
+    );
+    protocol_output.push(response.to_string());
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["workspace"], serde_json::json!("alpha"));
+    let paths: Vec<&str> = content["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["src/a.rs"]);
+
+    let response = session.call_tool(
+        6,
+        "list_files",
+        serde_json::json!({ "workspace": "beta", "path": "src" }),
+    );
+    protocol_output.push(response.to_string());
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["workspace"], serde_json::json!("beta"));
+    let mut paths: Vec<&str> = content["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    paths.sort_unstable();
+    assert_eq!(paths, ["src/b.rs", "src/only_beta.rs"]);
+
+    // search: distinct markers per root, no cross-workspace results.
+    let response = session.call_tool(
+        7,
+        "search",
+        serde_json::json!({ "workspace": "alpha", "query": "UNIQUE_" }),
+    );
+    protocol_output.push(response.to_string());
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["workspace"], serde_json::json!("alpha"));
+    assert_eq!(content["match_count"], serde_json::json!(1));
+    assert_eq!(content["matches"][0]["path"], serde_json::json!("src/a.rs"));
+    // A search rooted at the workspace itself must not carry the absolute
+    // root — the workspace-relative rendering is ".".
+    assert_eq!(content["path"], serde_json::json!("."));
+
+    let response = session.call_tool(
+        8,
+        "search",
+        serde_json::json!({ "workspace": "beta", "query": "UNIQUE_" }),
+    );
+    protocol_output.push(response.to_string());
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["workspace"], serde_json::json!("beta"));
+    assert_eq!(content["matches"][0]["path"], serde_json::json!("src/b.rs"));
+
+    // Logical provenance + workspace-relative paths only: no absolute root
+    // may appear anywhere in the protocol output.
+    let all = protocol_output.join("\n");
+    for root in [alpha_root, beta_root] {
+        let root = root.to_string_lossy().into_owned();
+        assert!(
+            !all.contains(&root) || root.is_empty(),
+            "absolute root leaked into output"
+        );
+        assert!(
+            !all.contains(root.trim_start_matches('/')),
+            "root path leaked into output: {root}"
+        );
+    }
+
+    let (code, stderr) = session.shutdown();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+}
+
+#[test]
+fn registry_read_tools_reject_traversal_into_sibling_workspace() {
+    let (_tmp, cfg) = cross_workspace_registry();
+    let mut session = McpSession::start(&["--workspace-config", cfg.to_str().unwrap()]);
+    session.initialize();
+
+    let response = session.call_tool(
+        3,
+        "read_file",
+        serde_json::json!({ "workspace": "alpha", "path": "../beta/shared.txt" }),
+    );
+    let text = expect_tool_error(&response);
+    assert!(
+        text.contains("outside the configured workspace"),
+        "read_file traversal must be rejected: {text}"
+    );
+
+    let response = session.call_tool(
+        4,
+        "list_files",
+        serde_json::json!({ "workspace": "alpha", "path": "../beta" }),
+    );
+    let text = expect_tool_error(&response);
+    assert!(
+        text.contains("outside the configured workspace"),
+        "list_files traversal must be rejected: {text}"
+    );
+
+    let response = session.call_tool(
+        5,
+        "search",
+        serde_json::json!({ "workspace": "alpha", "query": "TOKEN", "path": "../beta" }),
+    );
+    let text = expect_tool_error(&response);
+    assert!(
+        text.contains("outside the configured workspace"),
+        "search traversal must be rejected: {text}"
+    );
+
+    // Registered neighbors stay outside alpha's root — and the server stays
+    // healthy after the rejections.
+    let response = session.call_tool(6, "list_workspaces", serde_json::json!({}));
+    assert!(response.get("error").is_none(), "{response}");
+
+    let (code, stderr) = session.shutdown();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(!stderr.contains("panic"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn registry_read_tools_reject_symlink_escape_into_sibling_workspace() {
+    let (tmp, cfg) = cross_workspace_registry();
+    std::os::unix::fs::symlink("../beta", tmp.path().join("alpha/leak")).unwrap();
+    let mut session = McpSession::start(&["--workspace-config", cfg.to_str().unwrap()]);
+    session.initialize();
+
+    let response = session.call_tool(
+        3,
+        "read_file",
+        serde_json::json!({ "workspace": "alpha", "path": "leak/shared.txt" }),
+    );
+    let text = expect_tool_error(&response);
+    assert!(
+        text.contains("outside the configured workspace"),
+        "symlinked read must be rejected: {text}"
+    );
+
+    let response = session.call_tool(
+        4,
+        "list_files",
+        serde_json::json!({ "workspace": "alpha", "path": "leak" }),
+    );
+    let text = expect_tool_error(&response);
+    assert!(
+        text.contains("outside the configured workspace"),
+        "symlinked listing must be rejected: {text}"
+    );
+
+    let response = session.call_tool(
+        5,
+        "search",
+        serde_json::json!({ "workspace": "alpha", "query": "TOKEN", "path": "leak" }),
+    );
+    let text = expect_tool_error(&response);
+    assert!(
+        text.contains("outside the configured workspace"),
+        "symlinked search root must be rejected: {text}"
+    );
+
+    let (code, stderr) = session.shutdown();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+}
+
+#[test]
+fn registry_read_tools_reject_invalid_workspace_selectors() {
+    let (_tmp, cfg) = cross_workspace_registry();
+    let mut session = McpSession::start(&["--workspace-config", cfg.to_str().unwrap()]);
+    session.initialize();
+
+    // Grammar violations fail at the WorkspaceId boundary — before any path
+    // handling — for every read-tool family, with the offending value named.
+    let mut id = 10;
+    for (tool, extra) in [
+        ("list_files", serde_json::json!({})),
+        ("read_file", serde_json::json!({ "path": "shared.txt" })),
+        ("search", serde_json::json!({ "query": "x" })),
+    ] {
+        for bad in ["../foo", "Nian-Vision"] {
+            let mut arguments = extra.clone();
+            arguments["workspace"] = serde_json::json!(bad);
+            let response = session.call_tool(id, tool, arguments);
+            id += 1;
+            let text = expect_tool_error(&response);
+            assert!(
+                text.contains("invalid workspace id") && text.contains(bad),
+                "{tool} selector '{bad}' must fail the id grammar check: {text}"
+            );
+        }
+    }
+    // Absolute-path selectors are not workspace ids either.
+    let response = session.call_tool(
+        id,
+        "read_file",
+        serde_json::json!({ "workspace": "/tmp/foo", "path": "shared.txt" }),
+    );
+    let text = expect_tool_error(&response);
+    assert!(text.contains("invalid workspace id"), "{text}");
+
+    let response = session.call_tool(30, "list_workspaces", serde_json::json!({}));
+    assert!(response.get("error").is_none(), "{response}");
+
+    let (code, stderr) = session.shutdown();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(!stderr.contains("panic"), "{stderr}");
+}
+
+#[test]
+fn registry_read_tools_unknown_workspace_is_bounded_then_healthy() {
+    let (_tmp, cfg) = cross_workspace_registry();
+    let mut session = McpSession::start(&["--workspace-config", cfg.to_str().unwrap()]);
+    session.initialize();
+
+    // A valid but unregistered id gets the bounded M2 error, per tool
+    // family — no enumeration, no fallback, no default workspace.
+    for (id, (tool, extra)) in (10..).zip([
+        ("read_file", serde_json::json!({ "path": "shared.txt" })),
+        ("list_files", serde_json::json!({})),
+        ("search", serde_json::json!({ "query": "x" })),
+    ]) {
+        let mut arguments = extra;
+        arguments["workspace"] = serde_json::json!("does-not-exist");
+        let response = session.call_tool(id, tool, arguments);
+        let text = expect_tool_error(&response);
+        assert!(
+            text.contains("Unknown workspace 'does-not-exist'")
+                && text.contains("Use list_workspaces to discover valid workspace IDs"),
+            "{tool}: {text}"
+        );
+        assert!(
+            !text.contains("alpha") && !text.contains("beta"),
+            "bounded error must not enumerate configured ids: {text}"
+        );
+    }
+
+    // The server remained healthy throughout: a valid read still works.
+    let response = session.call_tool(
+        20,
+        "read_file",
+        serde_json::json!({ "workspace": "alpha", "path": "shared.txt" }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(
+        response["result"]["structuredContent"]["lines"][0],
+        serde_json::json!("1: FROM_ALPHA")
+    );
 
     let (code, stderr) = session.shutdown();
     assert_eq!(code, Some(0), "stderr: {stderr}");

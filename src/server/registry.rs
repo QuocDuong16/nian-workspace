@@ -1,24 +1,26 @@
-//! Registry-mode MCP server (v0.2 M2): workspace discovery only.
+//! Registry-mode MCP server (v0.2 M3): workspace discovery plus read-only
+//! filesystem access.
 //!
 //! Constructed **only** in [`RuntimeMode::WorkspaceRegistry`], so this tool
-//! surface is the complete, authoritative registry-mode surface. The
-//! unmigrated single-workspace tools (files, search, patches, commands, git
-//! status/diff) are not registered here: `tools/list` shows only the two
-//! discovery tools, and direct invocation of anything else is rejected by
-//! the router as `tool not found` before any workspace is touched.
+//! surface is the complete, authoritative registry-mode surface. Every
+//! filesystem tool requires an explicit logical `WorkspaceId`, resolved by
+//! exact lookup into the immutable registry and served by the same
+//! hardened, context-based implementations the single-workspace server uses
+//! — no duplicated path logic, no default workspace, no mutable selection
+//! state, so concurrent calls for different workspaces are independent.
 //!
-//! Every request carries its own explicit logical `WorkspaceId` resolved by
-//! exact lookup into the immutable registry — no mutable "current
-//! workspace", no default, no shared selection state, so concurrent calls
-//! for different workspaces are independent.
+//! Unmigrated tools (patches, commands, git status/diff) are not registered
+//! here: `tools/list` shows only the available tools, and direct invocation
+//! of anything else is rejected by the router as `tool not found` before
+//! any workspace is touched.
 
 use crate::config::AppState;
-use crate::tools::{discovery, error_result, result_from_value};
+use crate::tools::{discovery, error_result, files, result_from_value, search};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 
-/// MCP server for registry mode (v0.2 M2): discovery only.
+/// MCP server for registry mode (v0.2 M3): discovery + read-only file access.
 #[derive(Clone)]
 pub struct RegistryServer {
     state: AppState,
@@ -56,6 +58,45 @@ impl RegistryServer {
             Err(err) => Ok(error_result(err)),
         }
     }
+
+    #[tool(
+        description = "List files and directories under a path in one selected workspace (logical ID from list_workspaces) with bounded depth. Paths are workspace-relative. Hidden entries and generated directories (node_modules, target, .git, ...) are skipped unless include_hidden is set."
+    )]
+    fn list_files(
+        &self,
+        Parameters(args): Parameters<files::RegistryListFilesArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        match files::registry_list_files(&self.state, args) {
+            Ok(value) => result_from_value(value),
+            Err(err) => Ok(error_result(err)),
+        }
+    }
+
+    #[tool(
+        description = "Read a UTF-8 text file from one selected workspace (logical ID from list_workspaces) with 1-based line numbers and line-range support. Paths are workspace-relative. Binary files are rejected. Output is bounded; read more with start_line/end_line."
+    )]
+    fn read_file(
+        &self,
+        Parameters(args): Parameters<files::RegistryReadFileArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        match files::registry_read_file(&self.state, args) {
+            Ok(value) => result_from_value(value),
+            Err(err) => Ok(error_result(err)),
+        }
+    }
+
+    #[tool(
+        description = "Fast regex/literal text search over the files of one selected workspace (logical ID from list_workspaces): every match reports its workspace-relative path and line number. Results are bounded. Hidden and generated directories are searched only when the requested path itself enters them (e.g. '.config', 'node_modules'); .git/.hg/.svn are never searched, not even through symlinks."
+    )]
+    fn search(
+        &self,
+        Parameters(args): Parameters<search::RegistrySearchArgs>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        match search::registry_search(&self.state, args) {
+            Ok(value) => result_from_value(value),
+            Err(err) => Ok(error_result(err)),
+        }
+    }
 }
 
 #[tool_handler(router = self.tool_router.clone())]
@@ -67,11 +108,13 @@ impl ServerHandler for RegistryServer {
                 crate::config::SERVER_VERSION.to_string(),
             ))
             .with_instructions(
-                "Workspace discovery only (registry mode): list_workspaces reports the \
-                 operator-configured workspace IDs and workspace_info inspects one of them \
-                 by its required `workspace` argument. File, search, patch, command, and \
-                 git status/diff tools are not available in this mode yet; there is no \
-                 default workspace.",
+                "Workspace discovery plus read-only file access (registry mode): \
+                 list_workspaces reports the operator-configured workspace IDs, and \
+                 workspace_info, list_files, read_file, and search each require a \
+                 `workspace` argument selecting one of those IDs. Paths are \
+                 workspace-relative and responses carry the selected workspace's logical \
+                 ID as provenance. Patching, command execution, and git status/diff are \
+                 not available in registry mode yet; there is no default workspace.",
             )
     }
 }
