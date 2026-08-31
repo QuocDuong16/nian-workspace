@@ -21,17 +21,9 @@ const MCP_HANDSHAKE: &str = concat!(
     "\n",
 );
 
-/// The v0.1 single-workspace tool surface, byte-for-byte.
-const SINGLE_MODE_TOOLS: &[&str] = &[
-    "apply_patch",
-    "git_diff",
-    "git_status",
-    "list_files",
-    "read_file",
-    "run_command",
-    "search",
-    "workspace_info",
-];
+mod common;
+
+use common::{REGISTRY_MODE_TOOLS, SINGLE_MODE_TOOLS};
 
 struct RunResult {
     code: Option<i32>,
@@ -516,6 +508,60 @@ fn exec_matrix_registry() -> (TempDir, PathBuf) {
     (tmp, path)
 }
 
+/// Capability-matrix registry (v0.2 M6): four workspaces covering every
+/// permission quadrant for end-to-end matrix verification —
+///
+///   readonly: no capabilities (a committed git repo, so the read-only Git
+///             tools keep working);
+///   writer:   write = true only;
+///   executor: exec = true only (untracked marker for the child-cwd proof);
+///   full:     write = true, exec = true, allow_shell = true.
+///
+/// Every quadrant is exercised through real MCP tools/call in one session,
+/// so a capability granted to one workspace can never promote another.
+fn capability_matrix_registry() -> (TempDir, PathBuf) {
+    let tmp = TempDir::new().unwrap();
+
+    let readonly = tmp.path().join("readonly");
+    std::fs::create_dir_all(&readonly).unwrap();
+    std::fs::write(readonly.join("const.txt"), "READONLY\n").unwrap();
+    git(&readonly, &["init", "--initial-branch=main"]);
+    pin_repo_config(&readonly);
+    git(&readonly, &["add", "."]);
+    git(&readonly, &["commit", "-m", "initial"]);
+
+    let writer = tmp.path().join("writer");
+    std::fs::create_dir_all(&writer).unwrap();
+    std::fs::write(writer.join("patch.txt"), "WRITER ORIGINAL\n").unwrap();
+
+    let executor = tmp.path().join("executor");
+    std::fs::create_dir_all(&executor).unwrap();
+    git(&executor, &["init", "--initial-branch=main"]);
+    pin_repo_config(&executor);
+    std::fs::write(executor.join("executor-marker.txt"), "EXECUTOR_MARKER\n").unwrap();
+
+    let full = tmp.path().join("full");
+    std::fs::create_dir_all(&full).unwrap();
+    std::fs::write(full.join("patch.txt"), "FULL ORIGINAL\n").unwrap();
+
+    let config = registry_config(
+        "version = 1",
+        &[
+            workspace_entry("readonly", &readonly, ""),
+            workspace_entry("writer", &writer, "write = true"),
+            workspace_entry("executor", &executor, "exec = true"),
+            workspace_entry(
+                "full",
+                &full,
+                "write = true\nexec = true\nallow_shell = true",
+            ),
+        ],
+    );
+    let path = tmp.path().join("workspaces.toml");
+    std::fs::write(&path, config).unwrap();
+    (tmp, path)
+}
+
 #[test]
 fn single_mode_tools_list_is_exactly_the_v01_surface() {
     let tmp = TempDir::new().unwrap();
@@ -571,6 +617,18 @@ fn single_mode_tools_list_is_exactly_the_v01_surface() {
             schema["properties"].get("workspace").is_none(),
             "single-mode {tool} must not have a workspace property: {schema}"
         );
+        // Shared argument schemas stay mode-neutral (M6): the CLI-flag
+        // wording belongs to single-mode *tool* descriptions, never to the
+        // input schemas both modes share.
+        if tool == "apply_patch" || tool == "run_command" {
+            let raw = schema.to_string();
+            assert!(
+                !raw.contains("--write")
+                    && !raw.contains("--exec")
+                    && !raw.contains("--allow-shell"),
+                "single-mode {tool} schema must be mode-neutral: {schema}"
+            );
+        }
     }
     // And the v0.1 calls still succeed without any selector.
     let response = session.call_tool(20, "list_files", serde_json::json!({}));
@@ -732,13 +790,16 @@ fn single_mode_mutation_tools_keep_the_v01_contract() {
     let response = session.call_tool(
         4,
         "run_command",
-        serde_json::json!({ "program": "echo", "args": ["v01-marker"] }),
+        serde_json::json!({ "program": "git", "args": ["--version"] }),
     );
     assert!(response.get("error").is_none(), "{response}");
     let content = &response["result"]["structuredContent"];
     assert_eq!(content["exit_code"], serde_json::json!(0));
     assert!(
-        content["stdout"].as_str().unwrap().contains("v01-marker"),
+        content["stdout"]
+            .as_str()
+            .unwrap()
+            .starts_with("git version"),
         "{content}"
     );
     assert!(
@@ -746,6 +807,37 @@ fn single_mode_mutation_tools_keep_the_v01_contract() {
         "single-mode run_command must not carry provenance: {content}"
     );
 
+    let (code, stderr) = session.shutdown();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+}
+
+#[test]
+fn single_mode_read_tools_never_carry_registry_provenance() {
+    // Single-mode read tools must not gain registry provenance either —
+    // only the shared implementations now support registry mode; the v0.1
+    // response contracts stay untouched.
+    let tmp2 = TempDir::new().unwrap();
+    std::fs::write(tmp2.path().join("note.txt"), b"plain\n").unwrap();
+    let mut session = McpSession::start(&[tmp2.path().to_str().unwrap()]);
+    session.initialize();
+    for (id, (tool, args)) in (3u64..).zip([
+        ("workspace_info", serde_json::json!({})),
+        ("list_files", serde_json::json!({ "path": "." })),
+        ("read_file", serde_json::json!({ "path": "note.txt" })),
+        ("search", serde_json::json!({ "query": "plain" })),
+    ]) {
+        let response = session.call_tool(id, tool, args);
+        assert!(response.get("error").is_none(), "{tool}: {response}");
+        let content = &response["result"]["structuredContent"];
+        assert!(
+            content.get("workspace").is_none(),
+            "single-mode {tool} must not carry provenance: {content}"
+        );
+        assert!(
+            response["result"].get("workspace").is_none(),
+            "single-mode {tool} result must not carry a workspace field: {response}"
+        );
+    }
     let (code, stderr) = session.shutdown();
     assert_eq!(code, Some(0), "stderr: {stderr}");
 }
@@ -861,21 +953,7 @@ fn registry_mode_advertises_the_full_capability_set() {
     let tools = session.list_tools();
     let mut names = tools.clone();
     names.sort();
-    assert_eq!(
-        names,
-        [
-            "apply_patch",
-            "git_diff",
-            "git_status",
-            "list_files",
-            "list_workspaces",
-            "read_file",
-            "run_command",
-            "search",
-            "workspace_info"
-        ],
-        "registry mode must advertise exactly the M5 full capability set"
-    );
+    assert_eq!(names, REGISTRY_MODE_TOOLS);
 
     // Every selector tool requires the logical workspace id; list_workspaces
     // takes no arguments. The selector schema uses the WorkspaceId grammar
@@ -933,6 +1011,18 @@ fn registry_mode_advertises_the_full_capability_set() {
         let pattern = workspace_selector_pattern(&schema)
             .expect("workspace selector must use the WorkspaceId pattern");
         assert_eq!(pattern, "^[a-z0-9][a-z0-9._-]{0,63}$");
+        // Shared argument schemas stay mode-neutral (M6): permissions come
+        // from the selected workspace's configuration, so the schemas must
+        // not carry single-mode CLI-flag wording.
+        if tool == "apply_patch" || tool == "run_command" {
+            let raw = schema.to_string();
+            assert!(
+                !raw.contains("--write")
+                    && !raw.contains("--exec")
+                    && !raw.contains("--allow-shell"),
+                "registry {tool} schema must be mode-neutral: {schema}"
+            );
+        }
     }
 
     // git_diff keeps every existing GitDiffArgs field available with its
@@ -2162,34 +2252,36 @@ fn registry_run_command_matrix_and_cwd_isolation() {
     assert!(stdout.contains("?? untracked_beta.txt"), "{stdout}");
     assert!(!stdout.contains("untracked_alpha.txt"), "{stdout}");
 
-    // Root cwd (".") runs inside the selected workspace.
+    // Root cwd (".") runs inside the selected workspace: the git prefix of
+    // the repo the child actually landed in is empty at the root (the
+    // cross-platform cwd proof — no Unix utilities).
     let response = session.call_tool(
         5,
         "run_command",
         serde_json::json!({
             "workspace": "alpha",
-            "program": "cat",
-            "args": ["tracked.txt"],
+            "program": "git",
+            "args": ["rev-parse", "--show-prefix"],
             "cwd": "."
         }),
     );
     assert!(response.get("error").is_none(), "{response}");
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["exit_code"], serde_json::json!(0));
     assert!(
-        response["result"]["structuredContent"]["stdout"]
-            .as_str()
-            .unwrap()
-            .contains("original"),
-        "{response}"
+        content["stdout"].as_str().unwrap().trim().is_empty(),
+        "root cwd must resolve to the workspace root: {content}"
     );
 
-    // exec denied: tool error, no side effect.
+    // exec denied: tool error, no side effect (`git init` would create the
+    // directory if the process were spawned — cross-platform probe).
     let response = session.call_tool(
         6,
         "run_command",
         serde_json::json!({
             "workspace": "locked",
-            "program": "touch",
-            "args": ["spawned-anyway"]
+            "program": "git",
+            "args": ["init", "spawned-anyway"]
         }),
     );
     let text = expect_tool_error(&response);
@@ -2214,7 +2306,7 @@ fn registry_run_command_matrix_and_cwd_isolation() {
         serde_json::json!({
             "workspace": "gamma",
             "shell": true,
-            "command": "touch shell-ran"
+            "command": "git init shell-ran"
         }),
     );
     let text = expect_tool_error(&response);
@@ -2227,26 +2319,25 @@ fn registry_run_command_matrix_and_cwd_isolation() {
         "denied shell spawned a process anyway"
     );
 
-    // shell allowed where the workspace permits it.
-    #[cfg(unix)]
-    {
-        let response = session.call_tool(
-            8,
-            "run_command",
-            serde_json::json!({
-                "workspace": "delta",
-                "shell": true,
-                "command": "echo shell-marker"
-            }),
-        );
-        assert!(response.get("error").is_none(), "{response}");
-        let content = &response["result"]["structuredContent"];
-        assert_eq!(content["workspace"], serde_json::json!("delta"));
-        assert!(
-            content["stdout"].as_str().unwrap().contains("shell-marker"),
-            "{content}"
-        );
-    }
+    // shell allowed where the workspace permits it (cross-platform: the
+    // `git init` side effect proves the shell really executed).
+    let response = session.call_tool(
+        8,
+        "run_command",
+        serde_json::json!({
+            "workspace": "delta",
+            "shell": true,
+            "command": "git init shell-ran-dir"
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["workspace"], serde_json::json!("delta"));
+    assert_eq!(content["exit_code"], serde_json::json!(0));
+    assert!(
+        tmp.path().join("delta/shell-ran-dir/.git").exists(),
+        "the shell command must have run inside delta: {content}"
+    );
 
     // cwd traversal is rejected before spawn; the server stays healthy.
     let response = session.call_tool(
@@ -2254,13 +2345,17 @@ fn registry_run_command_matrix_and_cwd_isolation() {
         "run_command",
         serde_json::json!({
             "workspace": "alpha",
-            "program": "cat",
-            "args": ["untracked_beta.txt"],
+            "program": "git",
+            "args": ["status", "--short"],
             "cwd": "../beta"
         }),
     );
     let text = expect_tool_error(&response);
     assert!(text.contains("outside the configured workspace"), "{text}");
+    assert!(
+        !text.contains(tmp.path().to_string_lossy().as_ref()),
+        "cwd resolution error must not expose roots: {text}"
+    );
 
     // Health after all failures: discovery, a read, and a valid command.
     let response = session.call_tool(10, "list_workspaces", serde_json::json!({}));
@@ -2288,6 +2383,221 @@ fn registry_run_command_matrix_and_cwd_isolation() {
 }
 
 #[test]
+fn registry_capability_matrix_over_mcp() {
+    let (tmp, cfg) = capability_matrix_registry();
+    let readonly = tmp.path().join("readonly");
+    let writer = tmp.path().join("writer");
+    let executor = tmp.path().join("executor");
+    let full = tmp.path().join("full");
+    let mut session = McpSession::start(&["--workspace-config", cfg.to_str().unwrap()]);
+    session.initialize();
+
+    // -- readonly: reads and Git inspection need no capability ---------------
+    let response = session.call_tool(
+        3,
+        "read_file",
+        serde_json::json!({ "workspace": "readonly", "path": "const.txt" }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    let response = session.call_tool(
+        4,
+        "git_status",
+        serde_json::json!({ "workspace": "readonly" }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["workspace"], serde_json::json!("readonly"));
+
+    // Mutation and execution are both denied.
+    let response = session.call_tool(
+        5,
+        "apply_patch",
+        serde_json::json!({
+            "workspace": "readonly",
+            "patch": "--- const.txt\n+++ const.txt\n@@ -1,1 +1,1 @@\n-READONLY\n+X\n"
+        }),
+    );
+    let text = expect_tool_error(&response);
+    assert!(
+        text.contains("Workspace 'readonly' does not allow file writes."),
+        "{text}"
+    );
+    assert!(
+        !text.contains(tmp.path().to_string_lossy().as_ref()),
+        "permission error must not expose roots: {text}"
+    );
+
+    let response = session.call_tool(
+        6,
+        "run_command",
+        serde_json::json!({
+            "workspace": "readonly",
+            "program": "git",
+            "args": ["--version"]
+        }),
+    );
+    let text = expect_tool_error(&response);
+    assert!(
+        text.contains("Workspace 'readonly' does not allow command execution."),
+        "{text}"
+    );
+
+    // -- writer: write = true allows patching only ---------------------------
+    let response = session.call_tool(
+        7,
+        "apply_patch",
+        serde_json::json!({
+            "workspace": "writer",
+            "patch": "--- patch.txt\n+++ patch.txt\n@@ -1,1 +1,1 @@\n-WRITER ORIGINAL\n+WRITER PATCHED\n"
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["workspace"], serde_json::json!("writer"));
+    assert_eq!(
+        std::fs::read_to_string(writer.join("patch.txt")).unwrap(),
+        "WRITER PATCHED\n"
+    );
+
+    // ...but exec stays denied even though executor and full run commands.
+    let response = session.call_tool(
+        8,
+        "run_command",
+        serde_json::json!({
+            "workspace": "writer",
+            "program": "git",
+            "args": ["--version"]
+        }),
+    );
+    let text = expect_tool_error(&response);
+    assert!(
+        text.contains("Workspace 'writer' does not allow command execution."),
+        "{text}"
+    );
+
+    // -- executor: exec = true allows direct commands only --------------------
+    // The child answers from the selected workspace's cwd (cross-platform
+    // git fixture), proving the selected context decided where it ran.
+    let response = session.call_tool(
+        9,
+        "run_command",
+        serde_json::json!({
+            "workspace": "executor",
+            "program": "git",
+            "args": ["status", "--short"]
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["workspace"], serde_json::json!("executor"));
+    assert!(
+        content["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("?? executor-marker.txt"),
+        "{content}"
+    );
+
+    // Shell stays denied even though full allows it — and no shell runs.
+    let response = session.call_tool(
+        10,
+        "run_command",
+        serde_json::json!({
+            "workspace": "executor",
+            "shell": true,
+            "command": "git init shell-ran"
+        }),
+    );
+    let text = expect_tool_error(&response);
+    assert!(
+        text.contains("Workspace 'executor' does not allow shell execution."),
+        "{text}"
+    );
+    assert!(
+        !executor.join("shell-ran").exists(),
+        "denied shell spawned a process anyway"
+    );
+
+    // ...and write stays denied even though writer and full patch.
+    std::fs::write(executor.join("patch.txt"), "EXECUTOR ORIGINAL\n").unwrap();
+    let response = session.call_tool(
+        11,
+        "apply_patch",
+        serde_json::json!({
+            "workspace": "executor",
+            "patch": "--- patch.txt\n+++ patch.txt\n@@ -1,1 +1,1 @@\n-EXECUTOR ORIGINAL\n+X\n"
+        }),
+    );
+    let text = expect_tool_error(&response);
+    assert!(
+        text.contains("Workspace 'executor' does not allow file writes."),
+        "{text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(executor.join("patch.txt")).unwrap(),
+        "EXECUTOR ORIGINAL\n"
+    );
+
+    // -- full: every capability applies, and nothing more --------------------
+    let response = session.call_tool(
+        12,
+        "apply_patch",
+        serde_json::json!({
+            "workspace": "full",
+            "patch": "--- patch.txt\n+++ patch.txt\n@@ -1,1 +1,1 @@\n-FULL ORIGINAL\n+FULL PATCHED\n"
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["workspace"], serde_json::json!("full"));
+
+    let response = session.call_tool(
+        13,
+        "run_command",
+        serde_json::json!({
+            "workspace": "full",
+            "program": "git",
+            "args": ["--version"]
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["exit_code"], serde_json::json!(0));
+
+    // shell = true additionally unlocks shell-mode commands.
+    let response = session.call_tool(
+        14,
+        "run_command",
+        serde_json::json!({
+            "workspace": "full",
+            "shell": true,
+            "command": "git init shell-ran"
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    let content = &response["result"]["structuredContent"];
+    assert_eq!(content["exit_code"], serde_json::json!(0));
+    assert!(
+        full.join("shell-ran/.git").exists(),
+        "the shell command must have run inside full: {content}"
+    );
+
+    // -- health: discovery still works after the full matrix -----------------
+    let response = session.call_tool(15, "list_workspaces", serde_json::json!({}));
+    assert!(response.get("error").is_none(), "{response}");
+
+    // The denied patch never touched the readonly workspace's file.
+    assert_eq!(
+        std::fs::read_to_string(readonly.join("const.txt")).unwrap(),
+        "READONLY\n"
+    );
+
+    let (code, stderr) = session.shutdown();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(!stderr.contains("panic"), "{stderr}");
+}
+
+#[test]
 fn registry_mutation_tools_reject_bad_selectors_cleanly() {
     let (tmp, cfg) = writable_repos_registry();
     let mut session = McpSession::start(&["--workspace-config", cfg.to_str().unwrap()]);
@@ -2304,7 +2614,7 @@ fn registry_mutation_tools_reject_bad_selectors_cleanly() {
         (
             4,
             "run_command",
-            serde_json::json!({ "program": "echo", "args": ["hi"] }),
+            serde_json::json!({ "program": "git", "args": ["--version"] }),
         ),
     ] {
         for bad in ["../foo", "Nian-Vision"] {
@@ -2329,7 +2639,7 @@ fn registry_mutation_tools_reject_bad_selectors_cleanly() {
         let mut arguments = if id == 10 {
             serde_json::json!({ "patch": "not even a patch" })
         } else {
-            serde_json::json!({ "program": "echo" })
+            serde_json::json!({ "program": "git" })
         };
         arguments["workspace"] = serde_json::json!("does-not-exist");
         let response = session.call_tool(id, tool, arguments);

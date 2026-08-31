@@ -106,6 +106,14 @@ Workspace IDs may contain dots (`.`). TOML dotted table syntax would split such 
 root = "/home/user/Workspace/project-v2"
 ```
 
+Each capability key unlocks exactly one tool behavior on that workspace:
+
+- `write = true` → `apply_patch` allowed on the workspace
+- `exec = true` → direct `run_command` allowed on the workspace
+- `allow_shell = true` → shell-mode `run_command` (`shell = true` requests) allowed — and requires `exec = true`
+
+Read access is implicit: every configured workspace is readable, and the Git read tools (`git_status`, `git_diff`) work on every workspace regardless of `write`/`exec`.
+
 The security properties of this configuration are fixed by design:
 
 - **Roots are explicitly operator-configured** and canonicalized once at startup; they are never chosen, switched, or supplied by MCP requests.
@@ -118,7 +126,7 @@ The security properties of this configuration are fixed by design:
 
 `--workspace-config` is mutually exclusive with a positional `WORKSPACE` root and with the `--write`/`--exec`/`--allow-shell` flags; combining them is rejected at startup. Transport and logging options are unchanged.
 
-**Registry-mode MCP tools (v0.2 M5): the full v0.1 tool set, with per-workspace capabilities.** Registry mode serves the complete single-workspace tool set plus discovery — exactly nine tools, each (except `list_workspaces`) selecting its workspace with a required logical `workspace` argument:
+**Registry-mode MCP tools (v0.2): the full v0.1 tool set, with per-workspace capabilities.** Registry mode serves the complete single-workspace tool set plus discovery — exactly nine tools, each (except `list_workspaces`) selecting its workspace with a required logical `workspace` argument:
 
 | Tool | Arguments | Effect |
 |---|---|---|
@@ -133,7 +141,7 @@ The security properties of this configuration are fixed by design:
 | `run_command` | `workspace` (required) + the single-mode `run_command` arguments | Direct process (or shell) execution inside the selected workspace. Requires that workspace's `exec = true`; `shell = true` additionally requires `allow_shell = true`. Denied workspaces never spawn a process. |
 
 - The `workspace` argument must be an exact, operator-configured workspace ID — no case folding, no aliases, no path interpretation, no default or fallback workspace. Unknown or malformed IDs are rejected with a bounded explicit error; `list_workspaces` is the recovery path.
-- **Mutation and execution are gated per workspace, not globally**: `apply_patch` requires the selected workspace's `write = true`, `run_command` requires its `exec = true`, and `shell = true` requires `allow_shell = true` (which itself requires `exec = true`). These checks run before any patch is parsed, any file is touched, or any process is spawned, and they are enforced independently for every request — one workspace's capabilities never promote another's.
+- **Mutation and execution are gated per workspace, not globally**: `apply_patch` requires the selected workspace's `write = true`, `run_command` requires its `exec = true`, and `shell = true` requires `allow_shell = true` (which itself requires `exec = true`). These checks run before any patch is parsed, any file is touched, or any process is spawned, and they are enforced independently for every request — one workspace's capabilities never promote another's. The single-mode `--write`/`--exec`/`--allow-shell` flags are rejected together with `--workspace-config` rather than promoted onto every configured workspace.
 - Registry tools go through the same hardened workspace resolver as single-workspace mode: `../` traversal, absolute paths outside the selected root, and symlinks that resolve outside it are rejected — including toward other registered workspaces, which remain outside each other's roots. This covers patch targets and `run_command`'s `cwd`; `run_command` is **not an OS sandbox** (see [Security](#security)).
 - Registry Git tools are read-only and workspace-scoped: output covers only the selected workspace even when Git discovers a larger parent repository above it, and `git_diff` pathspecs go through the same workspace resolver as every other path.
 - Registry-mode responses carry the selected workspace's logical ID as provenance and server-generated metadata and errors never contain filesystem roots or the configuration path. Child process output (`run_command` stdout/stderr) is the program's own output and is deliberately not sanitized.
@@ -292,9 +300,9 @@ http://127.0.0.1:8787/mcp
 
 Read this before enabling flags.
 
-- **`nian-workspace` is not an OS sandbox.** Workspace isolation prevents *filesystem tools* from addressing paths outside the configured root; command execution runs real local processes with the full permissions of your OS user. A command can trivially read and modify files anywhere on your system regardless of the workspace boundary — this applies in registry mode too, where only `run_command`'s `cwd` is workspace-restricted while the spawned program is not sandboxed and its stdout/stderr is arbitrary program output that may contain absolute host paths. Enable `--exec` (or a workspace's `exec = true` in registry mode) only for MCP clients you trust.
+- **`nian-workspace` is not an OS sandbox.** Workspace isolation prevents *filesystem tools* from addressing paths outside the configured root; command execution runs real local processes with the full permissions of your OS user. A spawned command can access files outside the workspace, use the network, and spawn descendants; it receives arbitrary arguments, and its stdout/stderr is unsanitized program output that may contain absolute host paths or sensitive local data — this applies in registry mode too, where only `run_command`'s `cwd` is workspace-restricted while the spawned program itself is not sandboxed. Enable `--exec` (or a workspace's `exec = true` in registry mode) only for MCP clients you trust.
 - **Workspace isolation** covers every filesystem-facing tool (`list_files`, `read_file`, `search`, `apply_patch`, `run_command` cwd, `git_diff` path). Requests containing `../` traversal, absolute paths outside the root, drive-letter tricks, or symlinks that resolve outside the root are rejected with explicit errors — including paths whose final component does not exist yet.
-- **Registry mode is startup-configured with per-workspace capabilities.** MCP requests select workspaces by operator-configured logical ID — never by path — and server-generated registry metadata and errors never contain filesystem roots; workspace responses carry the logical ID as provenance instead. Registry tools go through the same hardened workspace resolver as single-workspace mode, and registry Git output stays scoped to the selected workspace even when a larger parent repository is discovered. `apply_patch` requires the selected workspace's `write` capability and `run_command` its `exec` capability (`shell = true` additionally requires `allow_shell`), each enforced before anything is parsed or spawned. Tools not registered on a mode's router are not merely hidden from `tools/list`: they are rejected inside the router as `tool not found`, before any handler or workspace is touched.
+- **Registry mode is startup-configured with per-workspace capabilities.** MCP requests select workspaces by operator-configured logical ID — never by path — and server-generated registry metadata and errors never contain filesystem roots or the configuration path; workspace responses carry the logical ID as provenance instead. Registry tools go through the same hardened workspace resolver as single-workspace mode, and registry Git output stays scoped to the selected workspace even when a larger parent repository is discovered. `apply_patch` requires the selected workspace's `write` capability and `run_command` its `exec` capability (`shell = true` additionally requires `allow_shell`), each enforced before anything is parsed or spawned. Tools not registered on a mode's router are not merely hidden from `tools/list`: they are rejected inside the router as `tool not found`, before any handler or workspace is touched.
 - **`--allow-shell` is a separate flag because shell execution is strictly more dangerous**: `/bin/sh` (Unix) or `cmd.exe` (Windows) interprets the whole command line, enabling chaining, redirection, and expansion. It also requires `--exec`.
 - **Outputs are bounded** (~256 KiB per channel by default) with truncation metadata, so large logs and dumps cannot flood model context.
 - **HTTP mode is loopback-only.** Non-loopback bind addresses (`0.0.0.0`, LAN IPs) are rejected at startup: there is no authentication layer, so anything that can reach the port can use the enabled tools against your filesystem. For remote access, put an external secure tunnel (TLS/auth) in front of `127.0.0.1`.

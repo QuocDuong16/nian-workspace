@@ -1158,6 +1158,25 @@ mod tests {
             std::fs::read_to_string(tmp.path().join("locked/shared.txt")).unwrap(),
             "LOCKED_ORIGINAL\n"
         );
+
+        // Rejected even *before parsing*: this payload would fail the patch
+        // parser with a syntax error, so receiving the permission error
+        // proves the write gate runs ahead of any parsing or target probing.
+        let err = registry_apply_patch(
+            &state,
+            RegistryApplyPatchArgs {
+                workspace: rid("locked"),
+                args: ApplyPatchArgs {
+                    patch: "not even a patch".into(),
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Workspace 'locked' does not allow file writes."),
+            "permission gate must precede parsing: {err}"
+        );
     }
 
     #[test]

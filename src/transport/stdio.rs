@@ -5,7 +5,8 @@
 //!
 //! The transport selects the mode-specific MCP server exactly once at
 //! startup (v0.2 M2): single-workspace mode serves the unchanged v0.1 tool
-//! surface, registry mode serves discovery only.
+//! surface, registry mode serves workspace discovery plus the full v0.1
+//! capability set with per-workspace capabilities.
 
 use crate::config::{AppState, RuntimeMode};
 use crate::server::{NianWorkspaceServer, RegistryServer};

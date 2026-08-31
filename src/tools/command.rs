@@ -50,10 +50,11 @@ pub struct RunCommandArgs {
     )]
     pub args: Option<Vec<String>>,
 
-    /// Run through the system shell (/bin/sh or cmd.exe); requires --allow-shell.
+    /// Run through the platform shell (/bin/sh on Unix, cmd.exe on Windows);
+    /// shell execution must be enabled for the selected configuration.
     #[serde(default)]
     #[schemars(
-        description = "Run `command` through the system shell instead of exec'ing a program directly. Requires the server to be started with --allow-shell."
+        description = "Run `command` through the platform shell instead of exec'ing a program directly. Shell execution must be enabled for the selected workspace/server configuration."
     )]
     pub shell: bool,
 
@@ -570,6 +571,30 @@ mod tests {
         state_with(Permissions::from_flags(true, true, false).unwrap())
     }
 
+    /// Run a git command in `dir`, asserting success. Test fixtures only;
+    /// identity is pinned per-invocation (per-child env), never process-wide.
+    ///
+    /// `git` is this suite's cross-platform command fixture: the project and
+    /// its tests already require it, and it behaves identically on Windows,
+    /// so command fixtures never assume Unix utilities like `echo` or `cat`.
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("git should be installed for tests");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     async fn run(state: &AppState, args: RunCommandArgs) -> Result<serde_json::Value, ToolError> {
         handle(state, args).await
     }
@@ -580,8 +605,8 @@ mod tests {
         let out = run(
             &state,
             RunCommandArgs {
-                program: Some("echo".into()),
-                args: Some(vec!["nian".into()]),
+                program: Some("git".into()),
+                args: Some(vec!["--version".into()]),
                 shell: false,
                 command: None,
                 cwd: None,
@@ -591,7 +616,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out["exit_code"], json!(0));
-        assert_eq!(out["stdout"], "nian\n");
+        let stdout = out["stdout"].as_str().unwrap();
+        assert!(
+            stdout.starts_with("git version"),
+            "stdout capture: {stdout:?}"
+        );
         assert_eq!(out["timed_out"], json!(false));
         assert!(out["duration_ms"].as_u64().is_some());
     }
@@ -602,8 +631,13 @@ mod tests {
         let out = run(
             &state,
             RunCommandArgs {
-                program: Some("false".into()),
-                args: None,
+                program: Some("git".into()),
+                // Fails (unknown revision) inside or outside a repository.
+                args: Some(vec![
+                    "rev-parse".into(),
+                    "--verify".into(),
+                    "nian-no-such-ref-xyz".into(),
+                ]),
                 shell: false,
                 command: None,
                 cwd: None,
@@ -613,6 +647,11 @@ mod tests {
         .await
         .unwrap();
         assert_ne!(out["exit_code"], json!(0));
+        assert!(
+            out["stderr"].as_str().unwrap().contains("fatal"),
+            "stderr capture: {:?}",
+            out["stderr"]
+        );
     }
 
     #[cfg(unix)]
@@ -1187,13 +1226,16 @@ mod tests {
     #[tokio::test]
     async fn cwd_is_relative_to_workspace() {
         let (t, state) = exec_state();
+        // Cross-platform cwd proof: `git rev-parse --show-prefix` reports the
+        // child's location inside its repository, so the printed prefix names
+        // the resolved cwd exactly — no `cat` or other Unix utility needed.
+        git(t.path(), &["init", "--quiet"]);
         std::fs::create_dir(t.path().join("sub")).unwrap();
-        std::fs::write(t.path().join("sub/marker.txt"), b"here\n").unwrap();
         let out = run(
             &state,
             RunCommandArgs {
-                program: Some("cat".into()),
-                args: Some(vec!["marker.txt".into()]),
+                program: Some("git".into()),
+                args: Some(vec!["rev-parse".into(), "--show-prefix".into()]),
                 shell: false,
                 command: None,
                 cwd: Some("sub".into()),
@@ -1203,14 +1245,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out["exit_code"], json!(0));
-        assert_eq!(out["stdout"], "here\n");
+        assert_eq!(out["stdout"], "sub/\n");
 
         // Escape attempt is rejected before spawning.
         let err = run(
             &state,
             RunCommandArgs {
-                program: Some("cat".into()),
-                args: Some(vec!["passwd".into()]),
+                program: Some("git".into()),
+                args: Some(vec!["status".into()]),
                 shell: false,
                 command: None,
                 cwd: Some("../../etc".into()),
@@ -1228,7 +1270,7 @@ mod tests {
         let err = run(
             &state,
             RunCommandArgs {
-                program: Some("echo".into()),
+                program: Some("git".into()),
                 args: None,
                 shell: false,
                 command: None,
@@ -1259,7 +1301,9 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("--allow-shell"));
 
-        // Enabled properly, shell mode works.
+        // Enabled properly, shell mode works. The `&&` chain proves the
+        // command really went through the platform shell, and `git init`
+        // side effects make it cross-platform (no Unix-only syntax).
         let (t2, state) = state_with(Permissions::from_flags(true, true, true).unwrap());
         let out = run(
             &state,
@@ -1267,10 +1311,7 @@ mod tests {
                 program: None,
                 args: None,
                 shell: true,
-                command: Some(format!(
-                    "cat hello.txt && echo done >> {}",
-                    t2.path().join("x").display()
-                )),
+                command: Some("git init shell-a && git init shell-b".into()),
                 cwd: None,
                 timeout_seconds: None,
             },
@@ -1278,6 +1319,11 @@ mod tests {
         .await
         .unwrap_or_else(|e| panic!("shell run failed: {e}"));
         assert_eq!(out["exit_code"], json!(0));
+        assert!(
+            t2.path().join("shell-a/.git").exists() && t2.path().join("shell-b/.git").exists(),
+            "the chained shell command must have run in the workspace: {:?}",
+            out
+        );
     }
 
     #[tokio::test]
@@ -1324,10 +1370,11 @@ mod tests {
         WorkspaceId::parse(s).expect("fixture workspace id")
     }
 
-    /// Five-workspace registry for the capability matrix: alpha/beta exec-only
-    /// with identical relative file layouts but distinct content (cwd
-    /// isolation), gamma exec-only (shell denied), delta exec+shell, locked
-    /// nothing.
+    /// Five-workspace registry for the capability matrix: alpha/beta are
+    /// exec-only git repositories with identical relative layouts but
+    /// distinct untracked markers (cwd/isolation proofs via `git status`,
+    /// the suite's cross-platform command fixture), gamma is exec-only
+    /// (shell denied), delta exec+shell, locked nothing.
     fn registry_fixture() -> (TempDir, AppState) {
         let tmp = TempDir::new().unwrap();
         let mut config = String::from("version = 1\n\n");
@@ -1341,6 +1388,13 @@ mod tests {
             let dir = tmp.path().join(name);
             std::fs::create_dir_all(dir.join("sub")).unwrap();
             std::fs::write(dir.join("sub/marker.txt"), format!("{name} marker\n")).unwrap();
+            if name == "alpha" || name == "beta" {
+                // Each becomes its own repository with a distinctly named
+                // untracked marker, so `git status --short` run by a child
+                // process proves which workspace's cwd it really ran in.
+                git(&dir, &["init", "--quiet"]);
+                std::fs::write(dir.join(format!("{name}-marker.txt")), b"").unwrap();
+            }
             config.push_str(&format!(
                 "[workspaces.{name}]\nroot = '{}'\n{caps}\n",
                 dir.display()
@@ -1385,37 +1439,48 @@ mod tests {
         // Identical relative requests against two workspaces must each see
         // only their own context's content: the selected WorkspaceContext
         // alone decides the child cwd — no process-global cwd, no mutable
-        // current workspace.
+        // current workspace. `git status --short` answers from the selected
+        // cwd, so each workspace reports only its own untracked marker.
         let out = registry_run_command(
             &state,
-            reg_args("alpha", direct("cat", &["sub/marker.txt"])),
+            reg_args("alpha", direct("git", &["status", "--short"])),
         )
         .await
         .unwrap();
         assert_eq!(out["workspace"], json!("alpha"));
         assert_eq!(out["exit_code"], json!(0));
-        assert_eq!(out["stdout"], "alpha marker\n");
+        let stdout = out["stdout"].as_str().unwrap();
+        assert!(stdout.contains("?? alpha-marker.txt"), "{stdout:?}");
+        assert!(
+            !stdout.contains("beta-marker.txt"),
+            "beta leaked into alpha's command output: {stdout:?}"
+        );
 
-        let out =
-            registry_run_command(&state, reg_args("beta", direct("cat", &["sub/marker.txt"])))
-                .await
-                .unwrap();
+        let out = registry_run_command(
+            &state,
+            reg_args("beta", direct("git", &["status", "--short"])),
+        )
+        .await
+        .unwrap();
         assert_eq!(out["workspace"], json!("beta"));
-        assert_eq!(out["stdout"], "beta marker\n");
+        let stdout = out["stdout"].as_str().unwrap();
+        assert!(stdout.contains("?? beta-marker.txt"), "{stdout:?}");
+        assert!(
+            !stdout.contains("alpha-marker.txt"),
+            "alpha leaked into beta's command output: {stdout:?}"
+        );
     }
 
     #[tokio::test]
     async fn registry_command_denied_exec_never_spawns_a_process() {
         let (tmp, state) = registry_fixture();
         // If a process were spawned despite the denial it would create this
-        // marker inside the denied workspace.
+        // directory inside the denied workspace (`git init` is the suite's
+        // cross-platform side-effect probe: no Unix-only utilities).
         let marker = tmp.path().join("locked").join("spawned-anyway");
         let err = registry_run_command(
             &state,
-            reg_args(
-                "locked",
-                direct("touch", &[marker.to_str().expect("utf-8 tmp path")]),
-            ),
+            reg_args("locked", direct("git", &["init", "spawned-anyway"])),
         )
         .await
         .unwrap_err();
@@ -1433,7 +1498,7 @@ mod tests {
 
         // shell=true on the same workspace is stopped by the exec gate that
         // runs first — also without any spawn.
-        let err = registry_run_command(&state, reg_args("locked", shell("true")))
+        let err = registry_run_command(&state, reg_args("locked", shell("git init would-spawn")))
             .await
             .unwrap_err();
         assert!(
@@ -1441,60 +1506,67 @@ mod tests {
                 .contains("Workspace 'locked' does not allow command execution."),
             "{err}"
         );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(!marker.exists(), "denied shell spawned a process anyway");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn registry_shell_denial_never_spawns_a_shell() {
         let (tmp, state) = registry_fixture();
-        let marker = tmp.path().join("gamma").join("shell-ran");
-        let err = registry_run_command(
-            &state,
-            reg_args("gamma", shell(&format!("touch {}", marker.display()))),
-        )
-        .await
-        .unwrap_err();
+        let err = registry_run_command(&state, reg_args("gamma", shell("git init shell-ran")))
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("Workspace 'gamma' does not allow shell execution."),
             "{msg}"
         );
+        assert!(
+            !msg.contains(tmp.path().to_string_lossy().as_ref()),
+            "permission error must not expose roots: {msg}"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        assert!(!marker.exists(), "denied shell spawned a process anyway");
+        assert!(
+            !tmp.path().join("gamma/shell-ran").exists(),
+            "denied shell spawned a process anyway"
+        );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn registry_shell_allowed_when_the_workspace_permits_it() {
-        let (_t, state) = registry_fixture();
-        let out = registry_run_command(&state, reg_args("delta", shell("echo shell-marker")))
+        let (tmp, state) = registry_fixture();
+        // `git init` side effect proves the shell actually executed, and the
+        // command is identical on every platform.
+        let out = registry_run_command(&state, reg_args("delta", shell("git init shell-ran-dir")))
             .await
             .unwrap();
         assert_eq!(out["workspace"], json!("delta"));
         assert_eq!(out["exit_code"], json!(0));
         assert!(
-            out["stdout"].as_str().unwrap().contains("shell-marker"),
-            "{out}"
+            tmp.path().join("delta/shell-ran-dir/.git").exists(),
+            "the shell command must have run inside delta: {out}"
         );
     }
 
     #[tokio::test]
     async fn registry_command_cwd_stays_inside_the_selected_workspace() {
         let (tmp, state) = registry_fixture();
-        // A subdirectory cwd resolves inside the selected workspace.
+        // A subdirectory cwd resolves inside the selected workspace. The git
+        // prefix names the child's exact location, so the selected context
+        // alone decides where the process runs.
         let out = registry_run_command(
             &state,
             reg_args(
                 "alpha",
                 RunCommandArgs {
                     cwd: Some("sub".into()),
-                    ..direct("cat", &["marker.txt"])
+                    ..direct("git", &["rev-parse", "--show-prefix"])
                 },
             ),
         )
         .await
         .unwrap();
-        assert_eq!(out["stdout"], "alpha marker\n");
+        assert_eq!(out["stdout"], "sub/\n");
 
         // Sibling traversal is rejected by the resolver before any spawn.
         let err = registry_run_command(
@@ -1503,15 +1575,17 @@ mod tests {
                 "alpha",
                 RunCommandArgs {
                     cwd: Some("../beta".into()),
-                    ..direct("cat", &["sub/marker.txt"])
+                    ..direct("git", &["status", "--short"])
                 },
             ),
         )
         .await
         .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("outside the configured workspace"), "{msg}");
         assert!(
-            err.to_string().contains("outside the configured workspace"),
-            "{err}"
+            !msg.contains(tmp.path().to_string_lossy().as_ref()),
+            "cwd resolution error must not expose roots: {msg}"
         );
 
         // Absolute paths outside the selected root are rejected too — even
@@ -1522,7 +1596,7 @@ mod tests {
                 "alpha",
                 RunCommandArgs {
                     cwd: Some("/".into()),
-                    ..direct("true", &[])
+                    ..direct("git", &["status", "--short"])
                 },
             ),
         )
@@ -1572,9 +1646,12 @@ mod tests {
     #[tokio::test]
     async fn registry_unknown_workspace_is_bounded_and_spawns_nothing() {
         let (_t, state) = registry_fixture();
-        let err = registry_run_command(&state, reg_args("does-not-exist", direct("echo", &["hi"])))
-            .await
-            .unwrap_err();
+        let err = registry_run_command(
+            &state,
+            reg_args("does-not-exist", direct("git", &["--version"])),
+        )
+        .await
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("Unknown workspace 'does-not-exist'")
