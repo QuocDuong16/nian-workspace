@@ -9,7 +9,6 @@
 
 use crate::config::AppState;
 use crate::error::{ToolError, ToolResult};
-use crate::registry::WorkspaceRegistry;
 use crate::tools::workspace_info::{self, WorkspaceIdentity};
 use crate::workspace_id::WorkspaceId;
 use rmcp::schemars;
@@ -54,37 +53,28 @@ pub(crate) fn workspace_info(
     state: &AppState,
     args: WorkspaceInfoArgs,
 ) -> ToolResult<serde_json::Value> {
-    let registry = state.registry();
-    let ctx = registry
+    let ctx = state
+        .registry()
         .get(&args.workspace)
-        .ok_or_else(|| unknown_workspace(registry, &args.workspace))?;
+        .ok_or_else(|| unknown_workspace(&args.workspace))?;
     workspace_info::describe(&ctx, WorkspaceIdentity::Logical(&args.workspace))
 }
 
-/// Unknown ids are rejected explicitly; the error may enumerate the
-/// configured ids (logical names only, never roots) to help the client
-/// recover without a second round trip.
-fn unknown_workspace(registry: &WorkspaceRegistry, requested: &WorkspaceId) -> ToolError {
-    let ids: Vec<&str> = registry
-        .iter_sorted()
-        .into_iter()
-        .map(|ctx| {
-            ctx.id()
-                .expect("registry workspaces always have an id")
-                .as_str()
-        })
-        .collect();
+/// Unknown ids are rejected explicitly with a fixed-size, bounded message.
+/// The configured ids are deliberately not enumerated — discovery output and
+/// error text must both stay bounded regardless of registry size, and
+/// `list_workspaces` is the authoritative, paginated-free way to recover.
+fn unknown_workspace(requested: &WorkspaceId) -> ToolError {
     ToolError::msg(format!(
-        "Unknown workspace '{}'. Configured workspaces: {}. \
-         Use list_workspaces to discover valid workspace IDs.",
-        requested,
-        ids.join(", ")
+        "Unknown workspace '{}'. Use list_workspaces to discover valid workspace IDs.",
+        requested
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::{WorkspaceRegistry, MAX_REGISTRY_WORKSPACES};
     use tempfile::TempDir;
 
     /// Build a registry-mode AppState from workspace names declared in the
@@ -155,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_workspace_error_lists_ids_without_roots() {
+    fn unknown_workspace_error_is_bounded() {
         let (tmp, state) = registry_state(&["beta", "alpha"]);
 
         let err = workspace_info(
@@ -169,15 +159,82 @@ mod tests {
         let message = err.to_string();
         assert!(
             message.contains("Unknown workspace 'does-not-exist'"),
-            "{message}"
+            "the requested logical id must be preserved: {message}"
         );
         assert!(
-            message.contains("Configured workspaces: alpha, beta"),
-            "error should enumerate ids in deterministic order: {message}"
+            message.contains("Use list_workspaces to discover valid workspace IDs"),
+            "{message}"
+        );
+        // Bounded by construction: the configured ids are not enumerated
+        // (that would grow with registry size) and roots are never exposed.
+        assert!(
+            !message.contains("alpha") && !message.contains("beta"),
+            "error must not enumerate configured ids: {message}"
         );
         assert!(
             !message.contains(tmp.path().to_string_lossy().as_ref()),
             "errors must not expose filesystem roots: {message}"
+        );
+    }
+
+    #[test]
+    fn list_workspaces_at_maximum_registry_size_stays_within_output_bound() {
+        // Worst case for discovery output: the largest permitted registry,
+        // every id at the maximum 64-character length, every permission
+        // enabled. The MCP layer serializes the response twice (structured
+        // content plus pretty text fallback), so the intended bound is on
+        // the combined size. Actual worst case is roughly 25 KiB; the
+        // asserted budget of 64 KiB keeps headroom while remaining well
+        // under the server's ~256 KiB bounded-output envelope.
+        const OUTPUT_BOUND_BYTES: usize = 64 * 1024;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let mut config = String::from("version = 1\n\n");
+        for i in 0..MAX_REGISTRY_WORKSPACES {
+            let dir = tmp.path().join(format!("dir{i:02}"));
+            std::fs::create_dir_all(&dir).expect("fixture dir");
+            config.push_str(&format!(
+                "[workspaces.a{i:03}{}]\nroot = '{}'\nwrite = true\nexec = true\nallow_shell = true\n\n",
+                "-".repeat(60),
+                dir.display()
+            ));
+        }
+        let registry = WorkspaceRegistry::from_toml_str(&config).expect("max-size registry");
+        let state = AppState::from_registry(registry);
+
+        let value = list_workspaces(&state).expect("list_workspaces");
+        let entries = value["workspaces"].as_array().expect("workspaces array");
+        assert_eq!(entries.len(), MAX_REGISTRY_WORKSPACES);
+        // Deterministic WorkspaceId ordering is preserved at the maximum.
+        assert_eq!(
+            entries.first().unwrap()["id"],
+            json!(format!("a000{}", "-".repeat(60)))
+        );
+        assert_eq!(
+            entries.last().unwrap()["id"],
+            json!(format!(
+                "a{:03}{}",
+                MAX_REGISTRY_WORKSPACES - 1,
+                "-".repeat(60)
+            ))
+        );
+        for entry in entries {
+            assert_eq!(entry["permissions"]["shell"], json!(true));
+        }
+
+        // No roots may leak even at maximum size.
+        let structured = serde_json::to_string(&value).expect("serialize structured content");
+        assert!(
+            !structured.contains(tmp.path().to_string_lossy().as_ref()),
+            "discovery output must not expose roots: {structured}"
+        );
+
+        let pretty = serde_json::to_string_pretty(&value).expect("serialize text fallback");
+        let combined = structured.len() + pretty.len();
+        assert!(
+            combined < OUTPUT_BOUND_BYTES,
+            "worst-case discovery output ({combined} bytes, structured + text) \
+             must stay under the intended {OUTPUT_BOUND_BYTES}-byte bound"
         );
     }
 

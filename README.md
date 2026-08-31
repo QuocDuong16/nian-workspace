@@ -2,7 +2,7 @@
 
 A secure local workspace bridge for web-hosted AI clients using MCP.
 
-`nian-workspace` lets a remote or web-hosted AI work with a local coding project through the Model Context Protocol — without exposing an unauthenticated public filesystem or shell service. A single process serves one local workspace root — or, in registry mode, a fixed set of operator-configured workspaces — providing file inspection, search, edits, controlled command execution, and Git access, always scoped to the configured directory.
+`nian-workspace` lets a remote or web-hosted AI work with a local coding project through the Model Context Protocol — without exposing an unauthenticated public filesystem or shell service. A single process serves one local workspace root, providing file inspection, search, edits, controlled command execution, and Git access, always scoped to the configured directory. Alternatively, `--workspace-config` starts in registry mode over a fixed set of operator-configured workspaces; in the current release that mode exposes workspace discovery only (`list_workspaces`, `workspace_info`) — file, search, edit, command, and Git tools are not yet available in registry mode and arrive in later milestones.
 
 The reference integration is **ChatGPT + Secure MCP Tunnel**, which connects a web-hosted AI client to a local workspace without requiring the machine to accept inbound network connections.
 
@@ -113,6 +113,7 @@ The security properties of this configuration are fixed by design:
 - **Roots may not overlap**: duplicate roots (the same directory reached through different spellings, including symlink aliases and case-variant names on case-insensitive filesystems) and nested roots are rejected at startup in both directions, so a broader writable workspace cannot bypass a narrower read-only one. Comparison uses OS filesystem identity, not path strings.
 - **Permissions are per workspace and conservative by default**: `write`, `exec`, and `allow_shell` default to `false`; read access is implicit; `allow_shell = true` requires `exec = true`.
 - **Workspace IDs are validated logical names** (`[a-z0-9][a-z0-9._-]{0,63}`) — lowercase, 1–64 characters, no path semantics, no aliases, no case folding.
+- **Registry size is bounded**: a configuration may declare at most **64** workspaces. `list_workspaces` is the authoritative discovery mechanism and is never truncated or paginated, so the bound is enforced at startup instead — even worst-case discovery output (maximum-length IDs, all permissions) stays in the low tens of kilobytes.
 - Unknown or misspelled configuration fields are rejected rather than silently ignored.
 
 `--workspace-config` is mutually exclusive with a positional `WORKSPACE` root and with the `--write`/`--exec`/`--allow-shell` flags; combining them is rejected at startup. Transport and logging options are unchanged.

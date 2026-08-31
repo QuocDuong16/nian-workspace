@@ -577,11 +577,16 @@ fn registry_unknown_workspace_is_clean_error_and_server_survives() {
         text.contains("Unknown workspace 'does-not-exist'"),
         "unexpected error text: {text}"
     );
-    // The error may enumerate the configured ids (logical names only) in
-    // deterministic order to help the client recover.
+    // The error is bounded by construction: it must not enumerate every
+    // configured workspace id (registry size is unbounded from the client's
+    // perspective); discovery via list_workspaces is the recovery path.
     assert!(
-        text.contains("nian-home, nian-vision"),
-        "error should list configured ids in order: {text}"
+        text.contains("Use list_workspaces to discover valid workspace IDs"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("nian-home") && !text.contains("nian-vision"),
+        "bounded error must not enumerate configured ids: {text}"
     );
 
     // The server must remain fully usable after the failed call.

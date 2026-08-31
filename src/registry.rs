@@ -12,20 +12,24 @@
 //!
 //! 1. `version` exists and equals `1`;
 //! 2. at least one workspace is declared;
-//! 3. every workspace id is valid (see [`WorkspaceId::parse`]);
-//! 4. every root is an absolute path — a relative root would make the
+//! 3. at most [`MAX_REGISTRY_WORKSPACES`] are declared — registry-mode
+//!    discovery (`list_workspaces`) has no pagination and is never
+//!    truncated, so registry size is bounded up front to keep discovery
+//!    output bounded;
+//! 4. every workspace id is valid (see [`WorkspaceId::parse`]);
+//! 5. every root is an absolute path — a relative root would make the
 //!    security policy depend on the directory the server happened to be
 //!    started from;
-//! 5. every root exists and is a directory;
-//! 6. every root canonicalizes successfully;
-//! 7. duplicate roots — two spellings of the same filesystem directory,
+//! 6. every root exists and is a directory;
+//! 7. every root canonicalizes successfully;
+//! 8. duplicate roots — two spellings of the same filesystem directory,
 //!    including symlink aliases and case-variant spellings on a
 //!    case-insensitive filesystem — are rejected;
-//! 8. nested/overlapping roots are rejected in both directions using real
+//! 9. nested/overlapping roots are rejected in both directions using real
 //!    filesystem ancestry — a broader writable workspace would otherwise
 //!    bypass a narrower read-only one;
-//! 9. `allow_shell = true` requires `exec = true`;
-//! 10. unknown/malformed fields fail via strict TOML deserialization.
+//! 10. `allow_shell = true` requires `exec = true`;
+//! 11. unknown/malformed fields fail via strict TOML deserialization.
 //!
 //! Rules 7 and 8 use **filesystem identity**, never path strings or string
 //! case folding: the OS reports whether two paths denote the same directory
@@ -47,6 +51,19 @@ use std::sync::Arc;
 
 /// The only supported configuration format version.
 pub const SUPPORTED_CONFIG_VERSION: u64 = 1;
+
+/// Maximum number of workspaces a registry configuration may declare.
+///
+/// `list_workspaces` is the authoritative discovery mechanism and M2 gives
+/// it no pagination and no truncation, so the registry size itself is
+/// bounded at startup instead. Worst case — the full 64 workspaces, each
+/// with a maximum-length 64-character id and every permission enabled —
+/// serializes to roughly 25 KiB across the response's two representations
+/// (structured content plus pretty text fallback), comfortably inside the
+/// server's ~256 KiB bounded-output envelope, while leaving room for any
+/// realistic operator layout. Exceeding the limit is a startup error, not a
+/// silent shortening of discovery output.
+pub const MAX_REGISTRY_WORKSPACES: usize = 64;
 
 /// On-disk registry configuration schema (v0.2 M1).
 ///
@@ -124,6 +141,17 @@ impl WorkspaceRegistry {
         }
         if config.workspaces.is_empty() {
             bail!("Workspace config must declare at least one workspace under [workspaces.<id>].");
+        }
+        // Checked before any per-workspace probing: an oversized registry is
+        // rejected up front, deterministically, and before MCP serving.
+        if config.workspaces.len() > MAX_REGISTRY_WORKSPACES {
+            bail!(
+                "Workspace config declares {} workspaces, but a registry may contain at most \
+                 {MAX_REGISTRY_WORKSPACES}. list_workspaces is the authoritative discovery \
+                 mechanism and is never truncated, so registry size is bounded at startup \
+                 instead.",
+                config.workspaces.len()
+            );
         }
 
         // BTreeMap keys iterate in sorted order, so validation errors are
@@ -329,6 +357,61 @@ mod tests {
         assert!(!perms.write);
         assert!(!perms.exec);
         assert!(!perms.shell);
+    }
+
+    #[test]
+    fn accepts_registry_with_exactly_the_maximum_workspace_count() {
+        let tmp = TempDir::new().unwrap();
+        let mut entries: Vec<(String, PathBuf, String)> = Vec::new();
+        for i in 0..MAX_REGISTRY_WORKSPACES {
+            let dir = make_dir(&tmp, &format!("ws{i:02}"));
+            entries.push((
+                format!("w{i:02}"),
+                dir,
+                "write = true\nexec = true".to_string(),
+            ));
+        }
+        let refs: Vec<(&str, &Path, &str)> = entries
+            .iter()
+            .map(|(id, dir, perms)| (id.as_str(), dir.as_path(), perms.as_str()))
+            .collect();
+        let registry = build_ok(&config_for(&refs));
+
+        // Deterministic WorkspaceId order is preserved at the maximum size.
+        let ids: Vec<String> = registry
+            .iter_sorted()
+            .iter()
+            .map(|ctx| ctx.id().unwrap().to_string())
+            .collect();
+        assert_eq!(ids.len(), MAX_REGISTRY_WORKSPACES);
+        assert_eq!(ids.first().unwrap(), "w00");
+        assert_eq!(ids.last().unwrap(), "w63");
+    }
+
+    #[test]
+    fn rejects_registry_above_the_maximum_workspace_count() {
+        // The count check runs before any per-workspace probing, so
+        // nonexistent roots are sufficient here: the rejection must be the
+        // registry-size bound itself, not a missing-directory error.
+        let mut config = String::from("version = 1\n\n");
+        for i in 0..=MAX_REGISTRY_WORKSPACES {
+            config.push_str(&format!(
+                "[workspaces.w{i:02}]\nroot = '/nonexistent/ws{i:02}'\n\n"
+            ));
+        }
+
+        let err = build_err(&config);
+        assert!(
+            err.contains(&format!(
+                "declares {} workspaces",
+                MAX_REGISTRY_WORKSPACES + 1
+            )),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("at most {MAX_REGISTRY_WORKSPACES}")),
+            "{err}"
+        );
     }
 
     #[test]
