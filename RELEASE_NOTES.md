@@ -1,6 +1,6 @@
 # v0.2.0
 
-v0.2.0 adds multi-workspace registry mode on top of the v0.1 single-workspace MCP server, with no change to existing v0.1 behavior.
+v0.2.0 adds multi-workspace registry mode on top of the v0.1 single-workspace MCP server, with no breaking change to the existing v0.1 tool surface, schemas, or CLI permission model.
 
 ## Multi-workspace registry
 
