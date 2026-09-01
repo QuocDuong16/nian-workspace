@@ -5,7 +5,12 @@
 //!
 //! 1. **Lexical normalization** — collapse `.`, drop redundant separators,
 //!    and reject any request whose `..` components climb above their base
-//!    directory before the OS is ever consulted.
+//!    directory before the OS is ever consulted. Rooted or prefixed
+//!    spellings (a leading `/`, `\`, or a Windows drive prefix) are rejected
+//!    here too: on Windows such paths are frequently *not*
+//!    [`Path::is_absolute`], so silently discarding their root/prefix
+//!    components would reinterpret them as ordinary workspace-relative
+//!    names (e.g. `/etc/passwd` as `etc\passwd`).
 //! 2. **Physical resolution** — canonicalize the deepest existing ancestor,
 //!    so symlinked directories inside the workspace cannot retarget a path
 //!    outside it. Missing leaf components stay lexical (that is what allows
@@ -69,8 +74,9 @@ impl Workspace {
     /// using the v0.1 single-workspace presentation contract.
     ///
     /// Preserved exactly as before M3: paths below the root are
-    /// workspace-relative, and the workspace root itself renders as its
-    /// canonical absolute path. Registry-mode callers must use
+    /// workspace-relative (joined with `/` separators on every platform),
+    /// and the workspace root itself renders as its canonical absolute
+    /// path. Registry-mode callers must use
     /// [`Self::display_relative_as`] with [`PathPresentation::RegistryRelative`]
     /// instead, so canonical roots are never exposed to registry clients.
     pub fn display_relative(&self, path: &Path) -> String {
@@ -88,9 +94,13 @@ impl Workspace {
     /// - [`PathPresentation::RegistryRelative`]: v0.2 registry contract —
     ///   the selected root renders as `"."`, so canonical roots never
     ///   appear in registry responses or errors.
+    ///
+    /// Paths below the root always join their components with `/` — the
+    /// stable MCP-facing path grammar on every platform (see
+    /// [`slash_joined_relative`]).
     pub fn display_relative_as(&self, path: &Path, presentation: PathPresentation) -> String {
         match path.strip_prefix(&self.root_canonical) {
-            Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().into_owned(),
+            Ok(rel) if !rel.as_os_str().is_empty() => slash_joined_relative(rel),
             Ok(_) => match presentation {
                 PathPresentation::SingleCompatible => {
                     self.root_canonical.to_string_lossy().into_owned()
@@ -257,7 +267,16 @@ impl WorkspaceContext {
 }
 
 /// Push normalized components of `rel` onto `stack`, failing if the path
-/// tries to ascend above its base directory.
+/// tries to ascend above its base directory or is not genuinely relative.
+///
+/// Windows parses spellings such as `/x`, `\x`, and `C:x` as rooted or
+/// drive-prefixed without [`Path::is_absolute`] reporting them absolute, so
+/// this function must never silently discard [`Component::RootDir`] or
+/// [`Component::Prefix`]: doing so would reinterpret a rooted client path as
+/// an ordinary workspace-relative name (`/etc/passwd` → `etc\passwd`, a bare
+/// `/` → the workspace root). Genuinely absolute paths under the workspace
+/// root never carry a root/prefix component here, because the caller strips
+/// the canonical root before calling.
 fn collect_lexical(
     rel: &Path,
     stack: &mut Vec<OsString>,
@@ -272,13 +291,51 @@ fn collect_lexical(
                     return Err(escape_err());
                 }
             }
-            // Only reachable for the post-strip remainder of an absolute
-            // path whose prefix matched the workspace root; such remainders
-            // contain no additional RootDir/Prefix components.
-            Component::RootDir | Component::Prefix(_) => {}
+            // A rooted or prefixed spelling is never an ordinary relative
+            // name: reject it instead of reinterpreting it.
+            Component::RootDir | Component::Prefix(_) => return Err(escape_err()),
         }
     }
     Ok(())
+}
+
+/// Render a workspace-relative remainder with `/` separators on every
+/// platform — the stable MCP-facing path grammar for `list_files`, `search`,
+/// `git_diff` pathspecs, glob matching, and registry provenance.
+///
+/// The string is derived from `Path` components, never from a blind
+/// `replace('\\', "/")`: on Unix a backslash is a legal filename character
+/// and must survive presentation untouched. Only the component join is
+/// normalized; authorization and filesystem paths are unaffected.
+fn slash_joined_relative(rel: &Path) -> String {
+    let mut out = String::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(name) => {
+                if !out.is_empty() {
+                    out.push('/');
+                }
+                out.push_str(&name.to_string_lossy());
+            }
+            // Resolved paths are canonical, so Normal components are the
+            // practical case; the remaining lexical forms are rendered
+            // faithfully rather than guessed.
+            Component::ParentDir => {
+                if !out.is_empty() {
+                    out.push('/');
+                }
+                out.push_str("..");
+            }
+            Component::CurDir => {}
+            // Unreachable for a remainder below the canonical root (a
+            // root/prefix component cannot follow the stripped root); fall
+            // back to the native spelling instead of inventing one.
+            Component::RootDir | Component::Prefix(_) => {
+                return rel.to_string_lossy().into_owned();
+            }
+        }
+    }
+    out
 }
 
 /// Canonicalize `candidate` by walking up to the deepest ancestor that
@@ -479,6 +536,22 @@ mod tests {
             let resolved = ws.resolve(Some(r"src\main.rs")).unwrap();
             assert!(resolved.ends_with("src\\main.rs"));
         }
+
+        /// Windows regression (native release run): rooted and prefixed
+        /// spellings are frequently not `Path::is_absolute()` on Windows, so
+        /// the lexical stage must reject them instead of silently discarding
+        /// their RootDir/Prefix components — otherwise `/` reinterprets as
+        /// the workspace root and `/etc/passwd` as `etc\passwd` inside it.
+        #[test]
+        fn rooted_and_prefixed_spellings_are_never_workspace_relative() {
+            let (_tmp, ws) = make_workspace(&["src/main.rs"]);
+            for bad in ["/", "\\", "/outside/file", "\\outside\\file", "C:relative"] {
+                assert!(
+                    ws.resolve(Some(bad)).is_err(),
+                    "rooted/prefixed request '{bad}' must be rejected, not reinterpreted as workspace-relative"
+                );
+            }
+        }
     }
 
     #[test]
@@ -528,5 +601,61 @@ mod tests {
             ws.display_relative_as(&root.join("src"), PathPresentation::RegistryRelative),
             "src"
         );
+    }
+
+    #[test]
+    fn display_relative_joins_components_with_forward_slashes() {
+        // The MCP-facing relative grammar is `/` on every platform: the join
+        // is derived from Path components, so a native-separator path below
+        // the root still presents as `a/b/c.txt` (this is the regression
+        // test for the Windows `src\main.rs` presentation bug; on Unix it
+        // pins the same contract).
+        let (_tmp, ws) = make_workspace(&["a/b/c.txt"]);
+        let p = ws.root().join("a").join("b").join("c.txt");
+        assert_eq!(ws.display_relative(&p), "a/b/c.txt");
+        assert_eq!(
+            ws.display_relative_as(&p, PathPresentation::RegistryRelative),
+            "a/b/c.txt"
+        );
+    }
+
+    #[test]
+    fn collect_lexical_rejects_rooted_spellings() {
+        // `/x` parses with a leading RootDir on every platform. A resolver
+        // input like this must be rejected, never silently reinterpreted as
+        // the relative name `x` (the Windows-native manifestation: `/`,
+        // `/etc/passwd`, and `C:relative` are not `is_absolute()` there).
+        let mut stack: Vec<OsString> = Vec::new();
+        assert!(
+            collect_lexical(Path::new("/etc/passwd"), &mut stack, || {
+                ToolError::msg("escape")
+            })
+            .is_err(),
+            "rooted spellings must be rejected by the lexical stage"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn display_relative_preserves_literal_backslashes_in_names() {
+        // Why the join is component-based, not `replace('\\', "/")`: on Unix
+        // a backslash is a legal filename character and must survive
+        // presentation unchanged.
+        let (tmp, ws) = make_workspace(&[]);
+        std::fs::write(tmp.path().join("we\\ird.txt"), b"x").unwrap();
+        let p = ws.root().join("we\\ird.txt");
+        assert_eq!(ws.display_relative(&p), r"we\ird.txt");
+    }
+
+    #[cfg(windows)]
+    mod windows_presentation {
+        use super::*;
+
+        #[test]
+        fn display_relative_uses_forward_slashes_on_windows() {
+            let (_tmp, ws) = make_workspace(&["src/main.rs"]);
+            let p = ws.root().join("src").join("main.rs");
+            assert_eq!(ws.display_relative(&p), "src/main.rs");
+        }
     }
 }

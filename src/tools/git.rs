@@ -288,11 +288,28 @@ fn presented_git_error(
     .map(|out| out.stdout.trim().trim_end_matches('/').to_string())
     .unwrap_or_default();
     let root_str = ctx.root().to_string_lossy().into_owned();
-    let mut roots: Vec<&str> = vec![root_str.as_str()];
+    let mut roots: Vec<String> = vec![root_str];
     if !toplevel.is_empty() && toplevel != "/" {
-        roots.push(toplevel.as_str());
+        roots.push(toplevel.clone());
+        // Git reports its own toplevel spelling — forward slashes, never the
+        // `\\?\` verbatim prefix — while Rust's canonicalization of the same
+        // directory produces the verbatim form. A native Windows release run
+        // showed diagnostics that inherited the verbatim cwd prefix while
+        // keeping Git's separator style (`\\?\C:/repo/objects`), which
+        // neither spelling alone consumed whole. Include the
+        // filesystem-canonical spelling of the toplevel too when it differs:
+        // the display-variant redactor expands both, and longest-first
+        // matching collapses the diagnostic to `./…` instead of leaving a
+        // stray `\\?\` behind. Redaction stays presentation-only.
+        if let Ok(canon) = std::path::Path::new(&toplevel).canonicalize() {
+            let canon = canon.to_string_lossy().into_owned();
+            if canon != toplevel {
+                roots.push(canon);
+            }
+        }
     }
-    ToolError::msg(redact_display_variants(raw, &roots, "."))
+    let root_refs: Vec<&str> = roots.iter().map(String::as_str).collect();
+    ToolError::msg(redact_display_variants(raw, &root_refs, "."))
 }
 
 /// Redact every display spelling variant of every root from `text`,
@@ -319,7 +336,12 @@ fn redact_display_variants(text: &str, canonical_roots: &[&str], replacement: &s
 /// itself, its verbatim-prefix-stripped form (`\\?\C:\…` is what Rust's
 /// canonicalization produces on Windows), and the separator-swapped twin of
 /// each — Git prints forward slashes on Windows where Rust stores
-/// backslashes. A verbatim UNC root (`\\?\UNC\server\share\…`) additionally
+/// backslashes. A verbatim form additionally derives the *mixed* twin
+/// `\\?\C:/…` (verbatim device prefix kept, remainder separator-swapped):
+/// a native Windows run showed diagnostics that inherit the verbatim cwd
+/// prefix while the path itself keeps Git's forward-slash style, and a pure
+/// backslash↔slash swap of the whole string (`//?/…`) matches nothing
+/// anyone emits. A verbatim UNC root (`\\?\UNC\server\share\…`) likewise
 /// derives the ordinary UNC spellings `\\server\share\…` and
 /// `//server/share/…`, because a bare `UNC\…` strip is not how clients or
 /// Git spell UNC paths. Deduplicated and ordered deterministically; on Unix
@@ -345,6 +367,11 @@ fn path_display_variants(canonical: &str) -> Vec<String> {
         variants.push(form.clone());
         variants.push(form.replace('\\', "/"));
         variants.push(form.replace('/', "\\"));
+        // Mixed verbatim twin: keep the `\\?\` device prefix verbatim, swap
+        // only the remainder's separators (e.g. `\\?\C:/repo`).
+        if let Some(rest) = form.strip_prefix(r"\\?\") {
+            variants.push(format!(r"\\?\{}", rest.replace('\\', "/")));
+        }
     }
     variants.retain(|v| !v.is_empty());
     variants.sort();
@@ -1516,6 +1543,16 @@ mod tests {
                 .any(|v| v.starts_with(r"\\") && !v.starts_with(r"\\?\")),
             "drive path must not derive UNC spellings: {drive:?}"
         );
+
+        // Verbatim drive paths derive the mixed twin: verbatim device prefix
+        // kept, remainder separator-swapped (`\\?\C:/repo/alpha`). This is
+        // the spelling native Windows diagnostics inherit from the verbatim
+        // cwd while the path itself keeps Git's forward-slash style — the
+        // whole-string swap (`//?/…`) matches nothing anyone emits.
+        assert!(
+            drive.contains(&r"\\?\C:/repo/alpha".to_string()),
+            "missing mixed verbatim twin in {drive:?}"
+        );
     }
 
     #[test]
@@ -1561,5 +1598,61 @@ mod tests {
                 "UNC prefix collision must not be rewritten"
             );
         }
+    }
+
+    // -- parent-root verbatim redaction (native Windows release remediation) --
+
+    #[test]
+    fn parent_root_redaction_consumes_the_verbatim_git_spelling() {
+        // Native Windows failure: git reports the enclosing toplevel as
+        // `C:/repo`, but diagnostics may inherit the verbatim cwd prefix
+        // that Rust's canonicalization produced while keeping git's
+        // separator style. With both spellings as redaction roots the
+        // diagnostic collapses to `./objects` — never leaving `\\?\.`.
+        let redacted = redact_display_variants(
+            r"fatal: broken objects under '\\?\C:/repo/objects'",
+            &[r"\\?\C:\repo", "C:/repo"],
+            ".",
+        );
+        assert_eq!(redacted, r"fatal: broken objects under './objects'");
+
+        // The ordinary drive spellings of the same parent root stay covered.
+        let redacted = redact_display_variants(
+            r"fatal: broken objects under 'C:\repo\objects'",
+            &[r"\\?\C:\repo", "C:/repo"],
+            ".",
+        );
+        assert_eq!(redacted, r"fatal: broken objects under '.\objects'");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parent_toplevel_canonicalization_recovers_the_verbatim_form() {
+        // The exact recovery `presented_git_error` performs: canonicalize
+        // git's forward-slash toplevel spelling, confirm it lands on the
+        // verbatim form Rust produces natively, and verify both roots
+        // together redact the verbatim diagnostic spelling.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let verbatim = std::fs::canonicalize(tmp.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            verbatim.starts_with(r"\\?\"),
+            "Rust canonicalization is verbatim on Windows: {verbatim}"
+        );
+        let git_spelling = verbatim.strip_prefix(r"\\?\").unwrap().replace('\\', "/");
+        let recovered = std::fs::canonicalize(&git_spelling)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(recovered, verbatim, "git's spelling must canonicalize back");
+
+        let redacted = redact_display_variants(
+            &format!(r"fatal: broken objects under '{verbatim}/objects'"),
+            &[git_spelling.as_str(), verbatim.as_str()],
+            ".",
+        );
+        assert_eq!(redacted, "fatal: broken objects under './objects'");
     }
 }

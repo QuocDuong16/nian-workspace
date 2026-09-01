@@ -811,7 +811,13 @@ mod tests {
         assert_eq!(out["truncated"], json!(false));
     }
 
-    #[cfg(unix)]
+    // `setsid` — the external executable this fixture invokes — is a Linux
+    // userspace utility (util-linux), not a portable Unix guarantee: macOS
+    // does not ship it. The fixture exists specifically to simulate a
+    // descendant escaping process-group containment, so it is narrowed to
+    // Linux; every portable Unix process/timeout/drain test stays enabled
+    // on macOS. Production timeout/process-tree behavior is unchanged.
+    #[cfg(all(unix, target_os = "linux"))]
     #[tokio::test]
     async fn escaped_pipe_holder_cannot_turn_normal_exit_into_timeout() {
         // A setsid descendant escapes containment, so killing the tree cannot
@@ -919,7 +925,9 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // Linux-only fixture: invokes the external `setsid` executable (see the
+    // note on escaped_pipe_holder_cannot_turn_normal_exit_into_timeout).
+    #[cfg(all(unix, target_os = "linux"))]
     #[tokio::test]
     async fn timeout_preserves_output_from_completed_reader() {
         // A direct child that times out while one reader has already
@@ -1028,7 +1036,9 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // Linux-only fixture: invokes the external `setsid` executable (see the
+    // note on escaped_pipe_holder_cannot_turn_normal_exit_into_timeout).
+    #[cfg(all(unix, target_os = "linux"))]
     #[tokio::test]
     async fn post_timeout_cleanup_cannot_block_indefinitely() {
         // A descendant that escapes the process group (setsid) but keeps our
