@@ -1,0 +1,219 @@
+# Release pipeline for nian-workspace.
+#
+# Trigger policy (hard requirement): this workflow runs ONLY on version tags
+# (v*). Ordinary branch pushes and pull requests are handled by Forgejo Actions
+# (.forgejo/workflows/quality.yml) and must never consume GitHub-hosted
+# release runners. There is deliberately no push.branches, pull_request,
+# schedule, or workflow_dispatch trigger here, to conserve hosted runner usage.
+#
+# Native runner -> Rust target mapping (GitHub-hosted standard runners,
+# verified against actions/runner-images "Available Images" at release-prep
+# time, 2026-09):
+#   ubuntu-24.04      x64    -> x86_64-unknown-linux-gnu
+#   ubuntu-24.04-arm  arm64  -> aarch64-unknown-linux-gnu  (native ARM64 Linux runner;
+#                            standard ARM runners are free for public repositories)
+#   windows-2025      x64    -> x86_64-pc-windows-msvc     (MSVC; the Windows GNU target
+#                            is retired from the release set)
+#   macos-15-intel    x64    -> x86_64-apple-darwin        (Intel macOS runner)
+#   macos-15          arm64  -> aarch64-apple-darwin       (Apple Silicon runner)
+#
+# Each native job runs the test suite on the runner OS, builds with an explicit
+# --target (artifact identity comes from the matrix, not host assumptions),
+# smoke-tests the binary with `--help`, and uploads exactly one archive. The
+# publish job then generates one authoritative SHA256SUMS across all five
+# archives, verifies it, and creates the GitHub Release from RELEASE_NOTES.md.
+# Publication is rerunnable: if the release already exists, assets are
+# (re-)uploaded with --clobber instead of creating a duplicate release.
+#
+# Actions are pinned to immutable full commit SHAs (official actions only;
+# release publication uses the GitHub CLI, no third-party release action).
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    # Uniform bash semantics on Linux, macOS, and Windows runners.
+    shell: bash
+
+jobs:
+  verify:
+    # Fail fast, before the expensive native matrix, if the tag does not
+    # correspond to the package version and release notes.
+    name: Verify tag / version / release notes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -Eeuo pipefail
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+
+      - name: Verify tag matches Cargo.toml package version
+        run: |
+          set -Eeuo pipefail
+          tag="${GITHUB_REF_NAME}"
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "nian-workspace") | .version')"
+          test "${tag}" = "v${cargo_version}" || {
+            echo "Tag ${tag} does not match Cargo.toml package version ${cargo_version}" >&2
+            exit 1
+          }
+          echo "Tag ${tag} matches package version ${cargo_version}"
+
+      - name: Verify release notes heading matches tag
+        run: |
+          set -Eeuo pipefail
+          tag="${GITHUB_REF_NAME}"
+          heading="$(grep -m1 '^# ' RELEASE_NOTES.md || true)"
+          test "${heading}" = "# ${tag}" || {
+            echo "RELEASE_NOTES.md heading '${heading:-<missing>}' does not match release tag ${tag}" >&2
+            exit 1
+          }
+          echo "RELEASE_NOTES.md heading matches ${tag}"
+
+  build:
+    name: Native build/test (${{ matrix.target }} on ${{ matrix.runner }})
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: nian-workspace
+            archive: tar.gz
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: nian-workspace
+            archive: tar.gz
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: nian-workspace.exe
+            archive: zip
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: nian-workspace
+            archive: tar.gz
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            binary: nian-workspace
+            archive: tar.gz
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -Eeuo pipefail
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+
+      - name: cargo test --locked
+        run: cargo test --locked
+
+      - name: cargo build --release --locked
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # A successful compile is not enough for a release artifact: execute the
+      # freshly built binary on the same native runner. A native test failure
+      # anywhere in this matrix blocks publication (needs: build below).
+      - name: Smoke test the native binary
+        run: ./target/${{ matrix.target }}/release/${{ matrix.binary }} --help
+
+      - name: Package release archive
+        run: |
+          set -Eeuo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="nian-workspace-v${version}-${{ matrix.target }}"
+          mkdir -p "dist/stage/${name}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" README.md LICENSE RELEASE_NOTES.md "dist/stage/${name}/"
+          chmod 755 "dist/stage/${name}/${{ matrix.binary }}"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            pwsh -NoProfile -Command "Compress-Archive -Path 'dist/stage/${name}' -DestinationPath 'dist/${name}.zip' -Force"
+          else
+            tar -C dist/stage -czf "dist/${name}.tar.gz" "${name}"
+          fi
+          ls -l dist
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/nian-workspace-*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download all release archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist/artifacts
+          merge-multiple: true
+
+      # One authoritative checksum file for all public archives — not one per
+      # runner. The explicit file list doubles as a completeness check: a
+      # missing archive fails the job before publication.
+      - name: Generate and verify SHA256SUMS
+        run: |
+          set -Eeuo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          cd dist/artifacts
+          ls -l
+          sha256sum \
+            "nian-workspace-v${version}-x86_64-unknown-linux-gnu.tar.gz" \
+            "nian-workspace-v${version}-aarch64-unknown-linux-gnu.tar.gz" \
+            "nian-workspace-v${version}-x86_64-pc-windows-msvc.zip" \
+            "nian-workspace-v${version}-x86_64-apple-darwin.tar.gz" \
+            "nian-workspace-v${version}-aarch64-apple-darwin.tar.gz" \
+            > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Create or update the GitHub Release
+        run: |
+          set -Eeuo pipefail
+          tag="${GITHUB_REF_NAME}"
+          cd dist/artifacts
+          if gh release view "${tag}" --json id >/dev/null 2>&1; then
+            echo "Release ${tag} already exists — (re)uploading assets with --clobber"
+            gh release upload "${tag}" --clobber ./*
+          else
+            gh release create "${tag}" \
+              --title "${tag}" \
+              --notes-file "${GITHUB_WORKSPACE}/RELEASE_NOTES.md" \
+              ./*
+          fi
+          gh release view "${tag}"

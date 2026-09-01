@@ -50,7 +50,7 @@ cargo build --release --locked
 # Windows:     target/release/nian-workspace.exe
 ```
 
-Tagged releases also publish checksummed archives; release-time artifact coverage is a separate concern from the development CI gates (see [Platform support and CI honesty](#platform-support-and-ci-honesty) for the distinction between native, cross-compiled, and compile-only targets).
+Tagged releases publish checksummed native archives for Linux x86_64/arm64, Windows x86_64 MSVC, and macOS x86_64/arm64 — built by tag-triggered GitHub Actions on native runners (see [Platform support and CI honesty](#platform-support-and-ci-honesty) for the development-CI/release split).
 
 ## Usage
 
@@ -336,24 +336,25 @@ cargo test
 cargo build --release
 ```
 
-CI runs the same gates on Forgejo (see `.forgejo/workflows/quality.yml`), pinned to Rust 1.98.0 in a Linux container — matching `rust-toolchain.toml`, so local builds and CI use the same toolchain. `.forgejo/workflows/release.yml` handles release packaging when a `v*` tag is pushed.
+CI runs the same gates on Forgejo (see `.forgejo/workflows/quality.yml`), pinned to Rust 1.98.0 in a Linux container — matching `rust-toolchain.toml`, so local builds and CI use the same toolchain. Release packaging is a separate pipeline (`.github/workflows/release.yml`) that runs only when a `v*` tag is pushed, and never on ordinary development pushes or pull requests — see [Platform support and CI honesty](#platform-support-and-ci-honesty).
 
 ### Platform support and CI honesty
 
-The current Forgejo runner is an x86_64 Linux Docker runner. Release coverage is intentionally split by what the runner can actually do:
+CI is split by what each system can genuinely do:
 
-| Platform | CI validation | Release artifact | Notes |
-|---|---|---|---|
-| Linux x86_64 (`x86_64-unknown-linux-gnu`) | Native tests + native release build + binary smoke test | Yes | Runtime-tested on the runner OS/architecture. |
-| Linux arm64 (`aarch64-unknown-linux-gnu`) | Cross-target `cargo check` + cross-linked release build | Yes | Linked with the Debian AArch64 GNU cross-toolchain; not executed in CI. |
-| Windows x86_64 GNU (`x86_64-pc-windows-gnu`) | Cross-linked release build | Yes | Produces a real PE executable with MinGW-w64; not executed in CI. |
-| Windows x86_64 MSVC (`x86_64-pc-windows-msvc`) | Cross-target `cargo check` only | No | A Linux Docker runner does not provide the native MSVC linker/runtime. |
-| macOS x86_64 (`x86_64-apple-darwin`) | Cross-target `cargo check` only | No | Linking requires an Apple SDK/toolchain or a native macOS runner. |
-| macOS arm64 (`aarch64-apple-darwin`) | Cross-target `cargo check` only | No | Linking requires an Apple SDK/toolchain or a native macOS runner. |
+**Development CI — Forgejo Actions / DinD.** Ordinary pushes and pull requests run on the Linux x86_64 Docker runner (`.forgejo/workflows/quality.yml`): fmt, clippy, tests, a native Linux x86_64 release build, and foreign-target `cargo check` compile validation for Windows MSVC, both macOS targets, and Linux ARM64. Cross-target jobs are compile validation only — no foreign binary is executed, and no Windows/macOS release artifacts are produced here.
 
-The existing Forgejo release workflow publishes `nian-workspace-vX.Y.Z-<target>` archives plus a `SHA256SUMS` file for the targets it can genuinely link today. The quality workflow compile-checks Windows MSVC, both macOS targets, and Linux ARM64 — that is compile validation, not native runtime validation; nothing in CI executes a foreign-target binary. Native Windows/macOS runtime validation and native release artifacts require native runners, which the current CI setup does not provide.
+**Release builds — GitHub Actions, tag-triggered only.** `.github/workflows/release.yml` runs only when a `v*` tag is pushed — it has no branch, pull request, scheduled, or manual trigger — so GitHub-hosted Windows/macOS/Linux native runners are consumed only at release time, never on ordinary development pushes. A lightweight consistency job runs first and fails the run before the expensive native matrix if the tag does not match the Cargo.toml package version or `RELEASE_NOTES.md` is not headed with the same version. Each release target then builds on a native GitHub-hosted runner of the matching architecture — each entry lists its runner, Rust target, binary, and archive format:
 
-Release artifact coverage is handled separately at release time and is not permanently tied to the Forgejo runner set. When the project prepares a multi-platform release, native release artifacts are planned to be built by tag-triggered GitHub Actions workflows, so GitHub-hosted Windows/macOS/Linux runners are consumed only at release time — not on every development push. That workflow does not exist yet; designing it is part of later release preparation. Normal development CI (pushes and pull requests) remains on Forgejo Actions/DinD with the strategy described above, and no fake Windows/macOS runtime claims are made anywhere.
+| Platform | Rust target | Native runner | Release validation | Release artifact |
+|---|---|---|---|---|
+| Linux x86_64 | `x86_64-unknown-linux-gnu` | `ubuntu-24.04` | `cargo test --locked`, release build, binary smoke test on the runner | `nian-workspace-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 | `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm` | Same, on a native ARM64 Linux runner | `nian-workspace-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `x86_64-pc-windows-msvc` | `windows-2025` | Same, natively under MSVC | `nian-workspace-vX.Y.Z-x86_64-pc-windows-msvc.zip` |
+| macOS x86_64 | `x86_64-apple-darwin` | `macos-15-intel` | Same, on an Intel macOS runner | `nian-workspace-vX.Y.Z-x86_64-apple-darwin.tar.gz` |
+| macOS arm64 | `aarch64-apple-darwin` | `macos-15` | Same, on an Apple Silicon runner | `nian-workspace-vX.Y.Z-aarch64-apple-darwin.tar.gz` |
+
+Each archive contains the binary, `README.md`, `LICENSE`, and `RELEASE_NOTES.md` inside a top-level `nian-workspace-vX.Y.Z-<target>/` directory. One authoritative `SHA256SUMS` file covering all five archives is generated and verified centrally before publication, and the GitHub Release body comes from `RELEASE_NOTES.md`. A native test failure on any platform blocks the release — failing native tests are not disabled to produce an artifact.
 
 ## License
 
