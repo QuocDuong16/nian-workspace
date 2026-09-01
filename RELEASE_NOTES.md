@@ -32,6 +32,7 @@ v0.2.0 adds multi-workspace registry mode on top of the v0.1 single-workspace MC
 - `apply_patch` routes through the selected workspace and requires that workspace's `write` capability.
 - `run_command` routes through the selected workspace and requires `exec`; shell mode additionally requires `allow_shell`.
 - `run_command` is NOT an OS sandbox. Only its cwd is workspace-restricted; the spawned program runs with the OS user's privileges and may access resources outside the workspace.
+- MCP initialization now reports runtime OS/architecture and shell-mode semantics so clients can choose platform-appropriate commands.
 
 ## Compatibility
 

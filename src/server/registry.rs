@@ -166,7 +166,7 @@ impl ServerHandler for RegistryServer {
                 crate::config::SERVER_NAME.to_string(),
                 crate::config::SERVER_VERSION.to_string(),
             ))
-            .with_instructions(
+            .with_instructions(format!(
                 "Registry mode over operator-configured workspaces: list_workspaces reports \
                  the workspace IDs, and every other tool requires a `workspace` argument \
                  selecting one of those IDs. Read tools (workspace_info, list_files, \
@@ -175,8 +175,9 @@ impl ServerHandler for RegistryServer {
                  exec capability (shell=true additionally requires the shell capability) \
                  as configured at startup. Paths are workspace-relative, server-generated \
                  metadata never exposes filesystem roots, and responses carry the selected \
-                 workspace's logical ID as provenance. There is no default workspace.",
-            )
+                 workspace's logical ID as provenance. There is no default workspace. {}",
+                super::runtime_environment_instructions()
+            ))
     }
 }
 

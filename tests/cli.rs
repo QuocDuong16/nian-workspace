@@ -2759,3 +2759,102 @@ fn missing_workspace_config_file_is_rejected() {
         result.stderr
     );
 }
+
+// ---------------------------------------------------------------------------
+// Runtime-host instructions: ServerInfo.instructions must tell the MCP client
+// which OS/architecture it is talking to and what shell=true actually invokes,
+// before the client picks command syntax. Asserted against real initialize
+// responses for both modes, because the feature exists only if it reaches the
+// initialize result.
+// ---------------------------------------------------------------------------
+
+/// Runtime-host assertions shared by both modes: current OS/ARCH (the server
+/// binary's own compile/runtime constants), the direct-execution PATH
+/// semantics, and the platform-correct shell=true wording (macOS and Linux
+/// share the Unix branch; only Windows has the PowerShell caveat).
+fn assert_runtime_host_instructions(instructions: &str) {
+    assert!(
+        instructions.contains(std::env::consts::OS),
+        "instructions must contain the host OS: {instructions}"
+    );
+    assert!(
+        instructions.contains(std::env::consts::ARCH),
+        "instructions must contain the host architecture: {instructions}"
+    );
+    assert!(
+        instructions.contains(
+            "Direct run_command execution resolves programs through PATH without a shell."
+        ),
+        "instructions must describe direct execution: {instructions}"
+    );
+
+    #[cfg(windows)]
+    {
+        assert!(instructions.contains("cmd.exe"), "{instructions}");
+        assert!(instructions.contains("/C"), "{instructions}");
+        assert!(
+            instructions.contains("PowerShell is not implied by shell=true"),
+            "{instructions}"
+        );
+        assert!(
+            !instructions
+                .to_lowercase()
+                .contains("shell=true uses powershell"),
+            "shell=true must not be claimed to use PowerShell: {instructions}"
+        );
+    }
+    #[cfg(unix)]
+    {
+        assert!(instructions.contains("/bin/sh"), "{instructions}");
+        assert!(instructions.contains("-c"), "{instructions}");
+    }
+}
+
+#[test]
+fn single_mode_initialize_reports_runtime_host_environment() {
+    let tmp = TempDir::new().unwrap();
+    let mut session = McpSession::start(&[tmp.path().to_str().unwrap()]);
+    let init = session.initialize();
+
+    let instructions = init["result"]["instructions"]
+        .as_str()
+        .expect("server instructions in initialize result");
+    assert_runtime_host_instructions(instructions);
+
+    // The v0.1 single-mode guidance is preserved alongside the runtime host.
+    assert!(instructions.contains("--write"), "{instructions}");
+    assert!(instructions.contains("--exec"), "{instructions}");
+    assert!(instructions.contains("--allow-shell"), "{instructions}");
+
+    let (code, stderr) = session.shutdown();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+}
+
+#[test]
+fn registry_mode_initialize_reports_runtime_host_environment() {
+    let tmp = TempDir::new().unwrap();
+    let (_cfg_dir, cfg_path) = two_workspace_config(&tmp);
+    let mut session = McpSession::start(&["--workspace-config", cfg_path.to_str().unwrap()]);
+    let init = session.initialize();
+
+    let instructions = init["result"]["instructions"]
+        .as_str()
+        .expect("server instructions in initialize result");
+    assert_runtime_host_instructions(instructions);
+
+    // Registry guidance remains present, and no configured filesystem root
+    // leaks into the instructions.
+    assert!(instructions.contains("list_workspaces"), "{instructions}");
+    assert!(
+        instructions.contains("There is no default workspace"),
+        "{instructions}"
+    );
+    assert!(
+        !instructions.contains(tmp.path().to_str().unwrap()),
+        "instructions must not expose configured roots: {instructions}"
+    );
+
+    let (code, stderr) = session.shutdown();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(!stderr.contains("panic"), "{stderr}");
+}

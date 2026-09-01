@@ -153,8 +153,9 @@ impl ServerHandler for NianWorkspaceServer {
             ))
             .with_instructions(format!(
                 "Workspace-scoped file/search/exec/git tools rooted at '{}'. \
-                 Writes require --write; commands require --exec; shell syntax requires --allow-shell.",
-                self.state.workspace().root().display()
+                 Writes require --write; commands require --exec; shell syntax requires --allow-shell. {}",
+                self.state.workspace().root().display(),
+                super::runtime_environment_instructions()
             ))
     }
 }

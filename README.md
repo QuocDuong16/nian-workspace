@@ -152,6 +152,8 @@ The security properties of this configuration are fixed by design:
 
 The tool surface is mode-specific: single-workspace mode (a positional `WORKSPACE`) advertises exactly the table below with its v0.1 schemas, while registry mode (`--workspace-config`) advertises the same tool set plus `list_workspaces`, every tool except `list_workspaces` taking a required logical `workspace` argument and mutation/execution gated by the selected workspace's configured capabilities (see [the registry section](#workspace-registry-configuration-v02)).
 
+During MCP initialization, `nian-workspace` reports the runtime host in its server instructions: the host OS/architecture (e.g. `Runtime host: linux/x86_64`), the shell that `shell = true` actually invokes (`cmd.exe /C` on Windows, `/bin/sh -c` on Unix), and the fact that direct execution resolves programs through the process PATH — so clients can pick platform-appropriate command syntax. The environment is never probed: installed programs are not detected or listed (PowerShell is not implied by `shell = true`).
+
 | Tool | Read-only | Notes |
 |---|:-:|---|
 | `workspace_info` | ✔ | Root, name, permissions, Git branch |
