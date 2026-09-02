@@ -8,37 +8,39 @@
 //! add/remove/reload APIs exist, and workspace roots, ids, and permissions
 //! never change while the process runs.
 //!
-//! Startup validation fails before serving if the configuration is invalid:
+//! Every check below must pass before the registry is built and the server
+//! starts serving; an invalid configuration aborts startup rather than
+//! serving a weaker policy. These are the invariants a valid configuration
+//! must satisfy — not a documented execution order or compatibility contract:
 //!
-//! 1. `version` exists and equals `1`;
-//! 2. at least one workspace is declared;
-//! 3. at most [`MAX_REGISTRY_WORKSPACES`] are declared — registry-mode
-//!    discovery (`list_workspaces`) has no pagination and is never
-//!    truncated, so registry size is bounded up front to keep discovery
-//!    output bounded;
-//! 4. every workspace id is valid (see [`WorkspaceId::parse`]);
-//! 5. every root is an absolute path — a relative root would make the
-//!    security policy depend on the directory the server happened to be
-//!    started from;
-//! 6. every root exists and is a directory;
-//! 7. every root canonicalizes successfully;
-//! 8. duplicate roots — two spellings of the same filesystem directory,
-//!    including symlink aliases and case-variant spellings on a
-//!    case-insensitive filesystem — are rejected;
-//! 9. nested/overlapping roots are rejected in both directions using real
-//!    filesystem ancestry — a broader writable workspace would otherwise
-//!    bypass a narrower read-only one;
-//! 10. `allow_shell = true` requires `exec = true`;
-//! 11. unknown/malformed fields fail via strict TOML deserialization.
+//! * the TOML is deserialized strictly, so unknown/malformed fields fail
+//!   rather than being silently ignored;
+//! * `version` exists and is the supported configuration version;
+//! * the registry declares between one and [`MAX_REGISTRY_WORKSPACES`]
+//!   workspaces — registry-mode discovery (`list_workspaces`) has no
+//!   pagination and is never truncated, so registry size is bounded up
+//!   front to keep discovery output bounded;
+//! * every workspace id is valid (see [`WorkspaceId::parse`]);
+//! * every root is an absolute path — a relative root would make the
+//!   security policy depend on the directory the server happened to be
+//!   started from — and must exist, be a directory, and canonicalize
+//!   successfully;
+//! * `allow_shell = true` requires `exec = true`;
+//! * duplicate roots — two spellings of the same filesystem directory,
+//!   including symlink aliases and case-variant spellings on a
+//!   case-insensitive filesystem — are rejected;
+//! * nested/overlapping roots are rejected in both directions using real
+//!   filesystem ancestry — a broader writable workspace would otherwise
+//!   bypass a narrower read-only one.
 //!
-//! Rules 8 and 9 use **filesystem identity**, never path strings or string
-//! case folding: the OS reports whether two paths denote the same directory
-//! (device + inode on Unix, volume serial + file index on Windows). Two
-//! genuinely distinct directories therefore never collide, even when their
-//! names differ only by case on a case-sensitive filesystem, and sibling
-//! names such as `project` and `project-other` are not nesting. A root that
-//! cannot be probed aborts startup instead of being silently treated as
-//! "different".
+//! The duplicate and nested-root checks use **filesystem identity**, never
+//! path strings or string case folding: the OS reports whether two paths
+//! denote the same directory (device + inode on Unix, volume serial + file
+//! index on Windows). Two genuinely distinct directories therefore never
+//! collide, even when their names differ only by case on a case-sensitive
+//! filesystem, and sibling names such as `project` and `project-other` are
+//! not nesting. A root that cannot be probed aborts startup instead of being
+//! silently treated as "different".
 
 use crate::permissions::Permissions;
 use crate::workspace::{Workspace, WorkspaceContext};
