@@ -135,7 +135,7 @@ Modify files by applying a unified diff (`diff -u` / `git diff` format).
 
 | Argument | Type | Meaning |
 |---|---|---|
-| `diff` | string | Unified diff text. Multi-file diffs are applied as one unit. |
+| `patch` | string | Unified diff text. Multi-file diffs are applied as one unit. |
 
 - *(registry mode)* plus the required `workspace` selector.
 - Permission: requires the workspace's `write` capability (`--write` in single mode, `write = true` in registry mode). A denied workspace is rejected **before** anything is parsed or changed.
@@ -152,8 +152,8 @@ Execute a program inside the workspace.
 |---|---|---|---|
 | `program` | string | — | Executable to run, resolved via PATH (e.g. `cargo`). Ignored when `shell = true`. |
 | `args` | array of strings | — | Arguments passed verbatim to the program — never interpolated by a shell. |
-| `shell` | boolean | `false` | Run `shell_command` through the platform shell (`/bin/sh -c` on Unix, `cmd.exe /C` on Windows). |
-| `shell_command` | string | — | Shell command line to execute when `shell = true` (e.g. `cargo check && cargo test`). |
+| `shell` | boolean | `false` | Run `command` through the platform shell (`/bin/sh -c` on Unix, `cmd.exe /C` on Windows). |
+| `command` | string | — | Shell command line to execute when `shell = true` (e.g. `cargo check && cargo test`). |
 | `cwd` | string | *(root)* | Working directory relative to the workspace root. |
 | `timeout_seconds` | integer | `120` | Timeout (max `3600`). The whole process tree is killed on expiry. |
 

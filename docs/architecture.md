@@ -39,7 +39,7 @@ In single mode the context is built from CLI flags; in registry mode one context
 
 The registry is built completely before the server serves and is never mutated afterwards:
 
-- Configuration is parsed with strict deserialization (unknown fields rejected) and fully validated — version, size bound, ID grammar, absolute/exists/directory roots, duplicate and nested root rejection by filesystem identity, and the `allow_shell ⇒ exec` rule (full checklist in [configuration: validation order](configuration.md#validation-order-and-limits)).
+- Configuration is parsed with strict deserialization (unknown fields rejected) and fully validated — version, size bound, ID grammar, absolute/exists/directory roots, duplicate and nested root rejection by filesystem identity, and the `allow_shell ⇒ exec` rule (full checklist in [configuration: validation and limits](configuration.md#validation-and-limits)).
 - There is no runtime add/remove/reload API and no "current workspace" state: every request carries its own explicit workspace ID, looked up exactly (no case folding, aliases, or fallbacks).
 - Because `list_workspaces` has no pagination and never truncates, the registry size is bounded at startup (at most 64 workspaces) rather than bounding discovery output after the fact.
 

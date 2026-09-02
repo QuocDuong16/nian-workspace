@@ -8,7 +8,7 @@
   - [Workspace IDs](#workspace-ids)
   - [Root validation](#root-validation)
   - [Permissions](#permissions)
-  - [Validation order and limits](#validation-order-and-limits)
+  - [Validation and limits](#validation-and-limits)
 - [Choosing between the modes](#choosing-between-the-modes)
 
 ## Single-workspace mode
@@ -94,21 +94,18 @@ The validated registry is **immutable**: roots, IDs, and permissions never chang
 - Permissions are **per workspace and enforced per request**: one workspace's capabilities never promote another's.
 - The single-mode `--write`/`--exec`/`--allow-shell` flags are rejected together with `--workspace-config` rather than promoted onto every configured workspace.
 
-### Validation order and limits
+### Validation and limits
 
-Startup fails before serving if any check fails, in this order:
+A registry configuration is fully validated at startup, and the server fails to start — before serving any MCP traffic — if any check fails. The validations and invariants are:
 
-1. `version` exists and equals `1`;
-2. at least one workspace is declared;
-3. at most **64** workspaces are declared — `list_workspaces` has no pagination and is never truncated, so registry size is bounded up front (worst-case discovery output stays in the low tens of kilobytes, inside the server's ~256 KiB bounded-output envelope);
-4. every workspace ID is valid;
-5. every root is absolute;
-6. every root exists and is a directory;
-7. every root canonicalizes;
-8. duplicate roots are rejected (filesystem identity);
-9. nested roots are rejected in both directions;
-10. `allow_shell = true` requires `exec = true`;
-11. unknown/malformed fields fail via strict TOML deserialization.
+- **Strict TOML deserialization**: unknown or misspelled fields are rejected rather than silently ignored.
+- `version` must exist and equal `1`.
+- At least one workspace must be declared, and at most **64** are allowed — `list_workspaces` has no pagination and is never truncated, so registry size is bounded up front (worst-case discovery output stays in the low tens of kilobytes, inside the server's ~256 KiB bounded-output envelope).
+- Every workspace ID must be valid ([grammar above](#workspace-ids)).
+- Every root must be an absolute path, must exist, and must be a directory.
+- Every root must canonicalize successfully.
+- Duplicate roots are rejected by OS filesystem identity, and nested roots are rejected in both directions.
+- `allow_shell = true` requires `exec = true`.
 
 `--workspace-config` is mutually exclusive with a positional `WORKSPACE` root and with `--write`/`--exec`/`--allow-shell`; combining them is rejected at startup. Transport and logging options are unchanged.
 

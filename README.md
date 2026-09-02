@@ -143,7 +143,7 @@ The operational rules:
 - **`allow_shell = true` requires `exec = true`**.
 - `--workspace-config` is mutually exclusive with a positional `WORKSPACE` and with `--write`/`--exec`/`--allow-shell`.
 
-The full configuration reference — ID grammar and quoting, validation order, and a single-vs-registry comparison — is in [docs/configuration.md](docs/configuration.md).
+The full configuration reference — ID grammar and quoting, validation rules, and a single-vs-registry comparison — is in [docs/configuration.md](docs/configuration.md).
 
 ## Secure MCP Tunnel
 
