@@ -2,12 +2,14 @@
 
 A secure local workspace bridge for web-hosted AI clients using MCP.
 
-`nian-workspace` lets a remote or web-hosted AI work with a local coding project through the Model Context Protocol — without exposing an unauthenticated public filesystem or shell service. A single process serves one local workspace root, providing file inspection, search, edits, controlled command execution, and Git access, always scoped to the configured directory. Alternatively, `--workspace-config` starts in registry mode over a fixed set of operator-configured workspaces; that mode serves the same full capability set — workspace discovery, file access, search, Git inspection, patching, and controlled command execution — every request selecting one workspace by logical ID, with mutation and execution gated by that workspace's own configured permissions.
+`nian-workspace` lets a remote AI client — such as ChatGPT — work with local coding projects through the Model Context Protocol, without exposing an unauthenticated public filesystem or shell service. One process serves either a single workspace directory or a fixed set of operator-configured workspaces, providing file inspection, search, edits, controlled command execution, and Git access, always scoped to the configured directories.
 
-The reference integration is **ChatGPT + Secure MCP Tunnel**, which connects a web-hosted AI client to a local workspace without requiring the machine to accept inbound network connections.
+> **What it is not:** `nian-workspace` is not an AI agent.
+> The MCP client is the agent. `nian-workspace` is the controlled local
+> workspace capability layer it operates through.
 
 ```text
-ChatGPT / web-hosted AI
+ChatGPT / MCP client
         |
         | MCP
         v
@@ -16,26 +18,58 @@ ChatGPT / web-hosted AI
         v
   nian-workspace
         |
-        +-- files / search
-        +-- patches
-        +-- commands
-        +-- Git
-        |
         v
-  local workspace
+ local coding workspaces
 ```
 
-Standard MCP compatibility also allows compatible local MCP clients to use `nian-workspace` as a direct stdio backend — see [Local MCP clients (stdio)](#local-mcp-clients-stdio) — but the primary design target is bridging a local workspace to a web-hosted AI through a secure tunnel.
+## Quick start
 
-> **What it is not:** `nian-workspace` is not an AI agent.
-> The MCP client is the agent. `nian-workspace` is the local execution and
-> workspace capability layer it operates through.
+1. Install `nian-workspace` — a prebuilt binary from the [GitHub Releases page](https://github.com/QuocDuong16/nian-workspace/releases) needs no Rust toolchain (see [Install](#install)).
+
+2. Describe the workspaces to serve in a TOML registry file, e.g. `workspaces.toml`:
+
+   ```toml
+   version = 1
+
+   [workspaces.nian-workspace]
+   root = "/home/user/Workspace/nian-workspace"
+   write = true
+   exec = true
+
+   [workspaces.nian-vision]
+   root = "/home/user/Workspace/nian-vision"
+   write = true
+   ```
+
+3. Run the server (stdio is the default MCP transport):
+
+   ```bash
+   nian-workspace --workspace-config /home/user/workspaces.toml
+   ```
+
+4. Connect it to ChatGPT through Secure MCP Tunnel — see [Secure MCP Tunnel](#secure-mcp-tunnel).
+
+Once connected, the client calls `list_workspaces` to discover the configured IDs (`nian-workspace`, `nian-vision`) and passes one as the `workspace` argument of every other tool.
+
+Prefer one workspace per process? Skip the TOML file and run `nian-workspace /path/to/project` (read-only by default; see [Basic usage](#basic-usage)).
 
 ## Install
 
-Requires Rust 1.98 or newer.
+Prebuilt, checksummed native archives are published on the [GitHub Releases page](https://github.com/QuocDuong16/nian-workspace/releases). No Rust toolchain is required to run them.
 
-### Build or install from source
+| Platform | Archive |
+|---|---|
+| Linux x86_64 | `nian-workspace-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 | `nian-workspace-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 (MSVC) | `nian-workspace-vX.Y.Z-x86_64-pc-windows-msvc.zip` |
+| macOS x86_64 | `nian-workspace-vX.Y.Z-x86_64-apple-darwin.tar.gz` |
+| macOS arm64 | `nian-workspace-vX.Y.Z-aarch64-apple-darwin.tar.gz` |
+
+Each archive contains the binary plus `README.md`, `LICENSE`, and `RELEASE_NOTES.md`. A `SHA256SUMS` file covering all archives is attached to the release for verification. Tagged releases are built and tested natively on each platform — see [docs/release.md](docs/release.md).
+
+### Build from source
+
+Building from source requires a Rust toolchain; Rust 1.98 or newer is supported (pinned in [`rust-toolchain.toml`](rust-toolchain.toml)).
 
 ```bash
 git clone https://github.com/QuocDuong16/nian-workspace.git
@@ -50,28 +84,25 @@ cargo build --release --locked
 # Windows:     target/release/nian-workspace.exe
 ```
 
-Tagged releases publish checksummed native archives for Linux x86_64/arm64, Windows x86_64 MSVC, and macOS x86_64/arm64 — built by tag-triggered GitHub Actions on native runners (see [Platform support and CI honesty](#platform-support-and-ci-honesty) for the development-CI/release split).
-
-## Usage
+## Basic usage
 
 ```
 nian-workspace [WORKSPACE] [OPTIONS]
 ```
 
+Without a positional workspace root, the current directory is served. The server starts **read-only**; every capability beyond reading must be enabled explicitly and is never promoted silently at runtime.
+
 | Flag | Effect |
 |---|---|
-| `--write` | Allow modifying workspace files (`apply_patch`) |
-| `--exec` | Allow executing local programs (`run_command`) |
-| `--allow-shell` | Allow commands through a system shell; requires `--exec` |
-| `--workspace-config <PATH>` | Load a versioned TOML workspace registry instead of a single workspace — see [Workspace registry configuration (v0.2)](#workspace-registry-configuration-v02) |
+| `--write` | Allow file edits through `apply_patch` |
+| `--exec` | Allow direct process execution (`run_command`) |
+| `--allow-shell` | Allow shell-mode execution — the system shell interprets the whole command line; requires `--exec` |
+| `--workspace-config <PATH>` | Serve a registry of named workspaces instead of one — see [Registry mode](#registry-mode) |
 | `--transport <stdio\|http>` | MCP transport (default: `stdio`) |
-| `--host <HOST>` | HTTP bind host — loopback only (`127.0.0.1`, `::1`, or `localhost`); non-loopback addresses are rejected |
-| `--port <PORT>` | HTTP port (default: `8787`) |
+| `--host <HOST>` / `--port <PORT>` | HTTP bind address — loopback only (default `127.0.0.1:8787`) |
 | `--log-level <LEVEL>` | `error`, `warn`, `info`, `debug` (or set `RUST_LOG`) |
 
-Permissions are cumulative and conservative: read-only by default; nothing is promoted silently at runtime.
-
-### Permission progression
+Permission progression:
 
 ```bash
 nian-workspace .                               # read-only
@@ -80,208 +111,84 @@ nian-workspace . --write --exec                # + run_command (no shell)
 nian-workspace . --write --exec --allow-shell  # + shell syntax (cmd.exe / /bin/sh)
 ```
 
-### Workspace registry configuration (v0.2)
+In registry mode the CLI permission flags are not used at all — each workspace's permissions come from the configuration file.
 
-Instead of a single positional workspace root, `--workspace-config <PATH>` loads an explicitly operator-configured registry of named workspace contexts:
+## Registry mode
+
+`--workspace-config <PATH>` loads a versioned TOML registry of named workspaces. One process serves all of them; each MCP request selects one workspace by its logical ID.
 
 ```toml
 version = 1
+
+[workspaces.nian-workspace]
+root = "/home/user/Workspace/nian-workspace"
+write = true
+exec = true
+allow_shell = false
 
 [workspaces.nian-vision]
 root = "/home/user/Workspace/nian-vision"
 write = true
 exec = true
 allow_shell = false
-
-[workspaces.nian-home]
-root = "/home/user/Workspace/nian-home"
 ```
 
-Registry roots must be **absolute paths**; a relative root is rejected at startup so the policy cannot depend on the directory the server was started from.
+The operational rules:
 
-Workspace IDs may contain dots (`.`). TOML dotted table syntax would split such an id into nested tables, so quote it in the header:
+- **Roots must be absolute** and must exist and be directories.
+- **Workspace IDs are logical names** — lowercase, 1–64 characters (`[a-z0-9][a-z0-9._-]{0,63}`). They are never filesystem paths.
+- **Roots are fixed at startup** — the registry is immutable while the process runs; there is no runtime add/remove/reload and no workspace switching.
+- **Overlapping or nested roots are rejected** at startup — including the same directory registered twice under different spellings — so a broader writable workspace cannot bypass a narrower read-only one.
+- **Permissions are per workspace**: read access is implicit; `write`, `exec`, and `allow_shell` default to `false`.
+- **`allow_shell = true` requires `exec = true`**.
+- `--workspace-config` is mutually exclusive with a positional `WORKSPACE` and with `--write`/`--exec`/`--allow-shell`.
 
-```toml
-[workspaces."project.v2"]
-root = "/home/user/Workspace/project-v2"
-```
+The full configuration reference — ID grammar and quoting, validation order, and a single-vs-registry comparison — is in [docs/configuration.md](docs/configuration.md).
 
-Each capability key unlocks exactly one tool behavior on that workspace:
+## Secure MCP Tunnel
 
-- `write = true` → `apply_patch` allowed on the workspace
-- `exec = true` → direct `run_command` allowed on the workspace
-- `allow_shell = true` → shell-mode `run_command` (`shell = true` requests) allowed — and requires `exec = true`
+This is the primary ChatGPT integration. ChatGPT connects to remote MCP servers rather than spawning local processes; Secure MCP Tunnel bridges a local `nian-workspace` stdio process to ChatGPT without exposing an unauthenticated HTTP listener to the public internet.
 
-Read access is implicit: every configured workspace is readable, and the Git read tools (`git_status`, `git_diff`) work on every workspace regardless of `write`/`exec`.
+**Supported baseline: `tunnel-client` v0.0.14 or newer.**
 
-The security properties of this configuration are fixed by design:
+1. Create (or reuse) a Secure MCP Tunnel and assign it to the ChatGPT workspace that will use the connector; otherwise it may not appear in the tunnel picker.
+2. Create a **Restricted Runtime API Key** for `tunnel-client` with only **Tunnels: Read** and **Tunnels: Use**. Do not use an Admin API key for the daemon.
+3. Export the key and tunnel ID, initialize a profile, and run it (registry-mode example):
 
-- **Roots are explicitly operator-configured** and canonicalized once at startup; they are never chosen, switched, or supplied by MCP requests.
-- **Roots are fixed for the lifetime of the process** — the registry is immutable after startup (no runtime add/remove/reload).
-- **Roots may not overlap**: duplicate roots (the same directory reached through different spellings, including symlink aliases and case-variant names on case-insensitive filesystems) and nested roots are rejected at startup in both directions, so a broader writable workspace cannot bypass a narrower read-only one. Comparison uses OS filesystem identity, not path strings.
-- **Permissions are per workspace and conservative by default**: `write`, `exec`, and `allow_shell` default to `false`; read access is implicit; `allow_shell = true` requires `exec = true`.
-- **Workspace IDs are validated logical names** (`[a-z0-9][a-z0-9._-]{0,63}`) — lowercase, 1–64 characters, no path semantics, no aliases, no case folding.
-- **Registry size is bounded**: a configuration may declare at most **64** workspaces. `list_workspaces` is the authoritative discovery mechanism and is never truncated or paginated, so the bound is enforced at startup instead — even worst-case discovery output (maximum-length IDs, all permissions) stays in the low tens of kilobytes.
-- Unknown or misspelled configuration fields are rejected rather than silently ignored.
+   ```bash
+   export CONTROL_PLANE_API_KEY='sk-...'
+   export CONTROL_PLANE_TUNNEL_ID='tunnel_...'
 
-`--workspace-config` is mutually exclusive with a positional `WORKSPACE` root and with the `--write`/`--exec`/`--allow-shell` flags; combining them is rejected at startup. Transport and logging options are unchanged.
+   tunnel-client init \
+     --sample sample_mcp_stdio_local \
+     --profile nian-workspace \
+     --tunnel-id "$CONTROL_PLANE_TUNNEL_ID" \
+     --mcp-command "/home/user/.local/bin/nian-workspace --workspace-config /home/user/workspaces.toml"
 
-**Registry-mode MCP tools (v0.2): the full v0.1 tool set, with per-workspace capabilities.** Registry mode serves the complete single-workspace tool set plus discovery — exactly nine tools, each (except `list_workspaces`) selecting its workspace with a required logical `workspace` argument:
+   tunnel-client doctor --profile nian-workspace --explain
+   tunnel-client run --profile nian-workspace
+   ```
 
-| Tool | Arguments | Effect |
-|---|---|---|
-| `list_workspaces` | none | The configured logical workspace IDs in deterministic ID order, each with its effective permissions. These IDs are the only valid workspace selectors; they are fixed by the operator at startup. |
-| `workspace_info` | `workspace` (required) | Metadata for one selected workspace: effective permissions and Git repository status. |
-| `list_files` | `workspace` (required) + the single-mode `list_files` arguments | Bounded-depth listing of one selected workspace; paths are workspace-relative. |
-| `read_file` | `workspace` (required) + the single-mode `read_file` arguments | Bounded, line-numbered text read from one selected workspace; binary files are rejected. |
-| `search` | `workspace` (required) + the single-mode `search` arguments | Bounded regex/literal search across one selected workspace; matches carry workspace-relative paths. |
-| `git_status` | `workspace` (required) | Working-tree status (`git status --short --branch` equivalent) scoped to the selected workspace — including when it sits inside a larger parent repository. |
-| `git_diff` | `workspace` (required) + the single-mode `git_diff` arguments (`staged`, `path`) | Unstaged or staged diff scoped to the selected workspace, optionally limited to one workspace-relative path. |
-| `apply_patch` | `workspace` (required) + the single-mode `apply_patch` arguments | Unified-diff patching of the selected workspace. Requires that workspace's `write = true`; denied workspaces are rejected before anything is parsed or changed. |
-| `run_command` | `workspace` (required) + the single-mode `run_command` arguments | Direct process (or shell) execution inside the selected workspace. Requires that workspace's `exec = true`; `shell = true` additionally requires `allow_shell = true`. Denied workspaces never spawn a process. |
+4. In ChatGPT, configure the custom MCP app/connector:
 
-- The `workspace` argument must be an exact, operator-configured workspace ID — no case folding, no aliases, no path interpretation, no default or fallback workspace. Unknown or malformed IDs are rejected with a bounded explicit error; `list_workspaces` is the recovery path.
-- **Mutation and execution are gated per workspace, not globally**: `apply_patch` requires the selected workspace's `write = true`, `run_command` requires its `exec = true`, and `shell = true` requires `allow_shell = true` (which itself requires `exec = true`). These checks run before any patch is parsed, any file is touched, or any process is spawned, and they are enforced independently for every request — one workspace's capabilities never promote another's. The single-mode `--write`/`--exec`/`--allow-shell` flags are rejected together with `--workspace-config` rather than promoted onto every configured workspace.
-- Registry tools go through the same hardened workspace resolver as single-workspace mode: `../` traversal, absolute paths outside the selected root, and symlinks that resolve outside it are rejected — including toward other registered workspaces, which remain outside each other's roots. This covers patch targets and `run_command`'s `cwd`; `run_command` is **not an OS sandbox** (see [Security](#security)).
-- Registry Git tools are read-only and workspace-scoped: output covers only the selected workspace even when Git discovers a larger parent repository above it, and `git_diff` pathspecs go through the same workspace resolver as every other path.
-- Registry-mode responses carry the selected workspace's logical ID as provenance and server-generated metadata and errors never contain filesystem roots or the configuration path. Child process output (`run_command` stdout/stderr) is the program's own output and is deliberately not sanitized.
-- There is no mutable "current workspace": every request carries its own explicit ID, and concurrent calls for different workspaces are independent.
-- Tools that are not part of this surface are not registered on the registry-mode router at all, so directly invoking one is rejected as a clean `tool not found` MCP error while the server stays usable.
+   ```text
+   Settings
+     → Connectors / custom MCP app
+     → Connection: Tunnel
+     → select the tunnel / tunnel ID
+     → Authentication: None
+   ```
 
-## Tools
+Notes:
 
-The tool surface is mode-specific: single-workspace mode (a positional `WORKSPACE`) advertises exactly the table below with its v0.1 schemas, while registry mode (`--workspace-config`) advertises the same tool set plus `list_workspaces`, every tool except `list_workspaces` taking a required logical `workspace` argument and mutation/execution gated by the selected workspace's configured capabilities (see [the registry section](#workspace-registry-configuration-v02)).
-
-During MCP initialization, `nian-workspace` reports the runtime host in its server instructions: the host OS/architecture (e.g. `Runtime host: linux/x86_64`), the shell that `shell = true` actually invokes (`cmd.exe /C` on Windows, `/bin/sh -c` on Unix), and the fact that direct execution resolves programs through the process PATH — so clients can pick platform-appropriate command syntax. The environment is never probed: installed programs are not detected or listed (PowerShell is not implied by `shell = true`).
-
-| Tool | Read-only | Notes |
-|---|:-:|---|
-| `workspace_info` | ✔ | Root, name, permissions, Git branch |
-| `list_files` | ✔ | Bounded depth, glob filter, skips `.git`/`node_modules`/`target`/… |
-| `read_file` | ✔ | 1-based line ranges, binary detection, bounded output |
-| `search` | ✔ | Regex or literal, capped results, every match carries its workspace-relative path. `.git`/`.hg`/`.svn` are never searched — not even through symlink aliases. Hidden and generated dirs are searched only when the requested path itself enters that territory (e.g. `path=".config"`, `path="node_modules"`); rooting at `src` does not unlock `src/.hidden` or `src/node_modules`. |
-| `git_status` | ✔ | `git status --short --branch` equivalent, paths relative to the workspace root |
-| `git_diff` | ✔ | Unstaged or staged diff, optional path filter, bounded; paths relative to the workspace root so output feeds `apply_patch` directly, even for workspaces nested inside a larger repository |
-| `apply_patch` | ✗ — single mode: `--write`; registry mode: `write = true` | Unified diff (`diff -u` / `git diff`). All hunks are validated before mutation, and each individual file replacement is atomic; an unexpected filesystem failure during the commit phase may leave a multi-file patch partially applied. New-file creation via `/dev/null` headers; renames/deletions rejected. Preserves existing newline style (LF/CRLF) and POSIX permission bits. |
-| `run_command` | ✗ — single mode: `--exec`; registry mode: `exec = true`; `shell:true` additionally needs the shell capability (`--allow-shell` in single mode, `allow_shell = true` in registry mode) | Direct process execution (`program` + `args`), no shell interpolation. `timeout_seconds` bounds the direct command process; expiry terminates the whole process tree (Unix and Windows). stdout/stderr are capped, output emitted before the timeout is preserved up to the caps, and a descendant holding the pipes after a successful exit can neither fake a timeout nor block the result. |
-
-## Client setup
-
-One process owns one fixed workspace (or, with `--workspace-config`, one fixed set of operator-configured workspaces). This is deliberate: the workspace boundary is fixed when the process starts instead of being switched by an MCP request.
-
-### ChatGPT + Secure MCP Tunnel
-
-This is the primary integration path. ChatGPT connects to remote MCP servers rather than directly spawning a local stdio process. Secure MCP Tunnel bridges a local `nian-workspace` stdio command to ChatGPT without exposing an unauthenticated HTTP listener to the public internet.
-
-Create or reuse a Secure MCP Tunnel, then create a **Restricted Runtime API Key** for `tunnel-client` with only **Tunnels: Read** and **Tunnels: Use**. Do not use an Admin API key for the daemon.
-
-When the tunnel is intended for ChatGPT, assign it to the ChatGPT workspace that will use the connector; otherwise it may not appear in the Tunnel picker.
-
-Export the runtime API key and tunnel ID before configuring the local profile:
-
-```bash
-export CONTROL_PLANE_API_KEY='sk-...'
-export CONTROL_PLANE_TUNNEL_ID='tunnel_...'
-
-tunnel-client init \
-  --sample sample_mcp_stdio_local \
-  --profile nian-workspace-my-project \
-  --tunnel-id "$CONTROL_PLANE_TUNNEL_ID" \
-  --mcp-command "/absolute/path/to/nian-workspace /absolute/path/to/my-project --write --exec"
-
-tunnel-client doctor \
-  --profile nian-workspace-my-project \
-  --explain
-
-tunnel-client run \
-  --profile nian-workspace-my-project
-```
-
-`CONTROL_PLANE_API_KEY` authenticates `tunnel-client` to the OpenAI tunnel control plane. It is **not** MCP authentication for `nian-workspace` itself; `nian-workspace` does not implement OAuth or bearer-token MCP authentication.
-
-In ChatGPT, configure the custom MCP app/connector using the tunnel directly:
-
-```text
-Settings
-  → Connectors / custom MCP app
-  → Connection: Tunnel
-  → select the tunnel / tunnel ID
-  → Authentication: None
-```
-
-#### Choosing the tunnel backend: single workspace or workspace registry
-
-Only **one backend should actively own a given tunnel at a time**. Stop the currently running profile before starting another profile that reuses the same tunnel — a profile switch changes which `nian-workspace` process is reachable. The active backend itself can take either of two forms.
-
-**Single workspace** (one project per process). The `tunnel-client init` example above is exactly this form: `--mcp-command` points at one fixed workspace root, and the process serves that root for the lifetime of the profile. To work on several projects this way, create several profiles with the same tunnel ID and a different `--mcp-command` workspace path, and run them one at a time.
-
-**Workspace registry** (several fixed workspaces in one process). A v0.2 registry profile gives ChatGPT a single MCP backend that serves every operator-configured workspace at once: `list_workspaces` discovers the configured logical workspace IDs, and each tool call selects one of them. The stdio command is the registry form of the server:
-
-```bash
-tunnel-client init \
-  --sample sample_mcp_stdio_local \
-  --profile nian-workspace-my-projects \
-  --tunnel-id "$CONTROL_PLANE_TUNNEL_ID" \
-  --mcp-command "/absolute/path/to/nian-workspace --workspace-config /absolute/path/to/workspaces.toml"
-```
-
-No permission flags are passed in this form: mutation and execution capabilities come from each workspace's own `write`/`exec`/`allow_shell` configuration (see [Workspace registry configuration (v0.2)](#workspace-registry-configuration-v02)), and the workspace set is fixed at startup. MCP requests select among the configured logical workspace IDs and never supply filesystem roots; there is no runtime workspace switching or registration.
-
-#### Long-running stdio backend: serialize concurrent MCP calls
-
-When `tunnel-client` forwards to a single long-lived `nian-workspace` stdio process, set `max_concurrent_requests` to `1` under the `mcp:` section of the profile configuration:
-
-```yaml
-mcp:
-  max_concurrent_requests: 1
-```
-
-`tunnel-client` itself supports concurrent MCP execution. When it forwards to a single long-lived `nian-workspace` stdio backend, repeated `tools/call` 502 failures have been observed during long-running tunnel sessions. Setting `max_concurrent_requests: 1` serializes MCP calls through the shared stdio backend and has proven more reliable in actual use, avoiding those failures. The precise root cause has not been established.
-
-This is a **runtime interoperability recommendation** for the `tunnel-client` + stdio deployment — it is not a protocol requirement of `nian-workspace` itself.
-
-The field is added to the existing `mcp:` mapping generated by `tunnel-client init` and must not replace the existing `commands:` entry:
-
-```yaml
-# ~/.config/tunnel-client/nian-workspace-my-project.yaml
-# ...
-control_plane:
-  tunnel_id: "tunnel_..."
-  api_key: env:CONTROL_PLANE_API_KEY
-
-mcp:
-  commands:
-    - channel: main
-      command: "/absolute/path/to/nian-workspace /absolute/path/to/my-project --write --exec"
-  max_concurrent_requests: 1
-```
-
-To set it per-run without editing the profile file, use the environment variable equivalent:
-
-```bash
-MCP_MAX_CONCURRENT_REQUESTS=1 \
-  tunnel-client run --profile nian-workspace-my-project
-```
-
-#### Troubleshooting: tunnel-client MCP tools/call failures
-
-If `tunnel-client` MCP `tools/call` requests fail with the following pattern:
-
-```json
-{
-  "status_code": 502,
-  "failure_source": "client_internal",
-  "upstream_response_received": false
-}
-```
-
-first confirm the `nian-workspace` stdio backend itself is healthy (check that the process is still running and responds to `tunnel-client doctor --profile <profile>`). If the backend is healthy and the failure recurs, the recommended first mitigation is to set `max_concurrent_requests: 1` (as described above) or pass the equivalent environment variable. This does not guarantee the issue is resolved. If failures continue, inspect the `tunnel-client` and `nian-workspace` logs for additional diagnostics.
+- `CONTROL_PLANE_API_KEY` authenticates `tunnel-client` to the tunnel control plane. It is **not** MCP authentication for `nian-workspace` itself, which implements no OAuth or bearer-token MCP authentication.
+- **Single workspace instead of a registry:** point `--mcp-command` at one workspace root with its flags — `--mcp-command "/path/to/nian-workspace /path/to/my-project --write --exec"` — and keep the rest of the setup identical. To work on several projects this way, create several profiles with the same tunnel ID and run them one at a time.
+- **Only one backend should actively own a given tunnel at a time.** Stop the currently running profile before starting another profile that reuses the same tunnel — a profile switch changes which `nian-workspace` process is reachable.
+- If tool calls fail, first confirm the `nian-workspace` backend is healthy (`tunnel-client doctor --profile <name>`, process still running) and inspect the `tunnel-client` and `nian-workspace` logs for diagnostics.
 
 ### Local MCP clients (stdio)
 
-Any MCP-compatible local client can use `nian-workspace` as a direct stdio backend. This is supported and useful, but it is a secondary use case — the primary design target is the web-hosted AI + Secure MCP Tunnel path described above.
-
-Point your client's MCP config at the installed binary and choose the project root in `args`:
+Any MCP-compatible local client can use `nian-workspace` as a direct stdio backend. This is supported, but the primary design target is the Secure MCP Tunnel path above.
 
 ```json
 {
@@ -294,42 +201,63 @@ Point your client's MCP config at the installed binary and choose the project ro
 }
 ```
 
-Use an absolute binary path if the client does not inherit your shell `PATH`. Add `--allow-shell` only when the client genuinely needs shell syntax; `--exec` alone is safer for ordinary process execution.
-
-Logs go to stderr; the protocol runs on stdout, so stderr redirection in a wrapper script will not corrupt the session.
+Use an absolute binary path if the client does not inherit your shell `PATH`. Logs go to stderr while the protocol runs on stdout, so redirecting stderr will not corrupt a session.
 
 ### Streamable HTTP
 
-For clients that can reach the machine directly through a trusted local/private path, run the built-in loopback-only Streamable HTTP transport:
+For clients that can reach the machine over a trusted local path, run the built-in loopback-only HTTP transport:
 
 ```bash
 nian-workspace . --write --exec --transport http --host 127.0.0.1 --port 8787
 ```
 
-The MCP endpoint is then served at:
+The MCP endpoint is then served at `http://127.0.0.1:8787/mcp`. Non-loopback binds are refused and there is no built-in authentication — for remote access, put a secure tunnel or another authenticated TLS layer in front of `127.0.0.1`.
 
-```text
-http://127.0.0.1:8787/mcp
-```
+## Tools
 
-`nian-workspace` deliberately refuses non-loopback HTTP binds and does not implement public-network authentication. For remote access, put a secure tunnel or another authenticated TLS layer in front of `127.0.0.1`; do not punch a public port through to it.
+The tool surface is mode-specific: single-workspace mode exposes exactly the eight tools below with the v0.1 schemas, while registry mode exposes those eight **plus `list_workspaces`** — every tool except `list_workspaces` then takes a required logical `workspace` argument.
+
+| Tool | Purpose | Permission |
+|---|---|---|
+| `workspace_info` | Workspace metadata: permissions, Git branch | read (implicit) |
+| `list_files` | Bounded directory listing | read (implicit) |
+| `read_file` | Line-numbered text read | read (implicit) |
+| `search` | Regex or literal text search | read (implicit) |
+| `git_status` | Working-tree status | read (implicit) |
+| `git_diff` | Unstaged or staged diff | read (implicit) |
+| `apply_patch` | Apply a unified diff | `write` |
+| `run_command` | Run a program directly (`shell = true` for shell syntax) | `exec` (shell mode also needs `allow_shell`) |
+| `list_workspaces` | *(registry mode only)* Configured IDs and their permissions | read (implicit) |
+
+The complete reference — argument schemas, output shapes, registry selectors, and bounded-output behavior — is in [docs/tools.md](docs/tools.md).
 
 ## Security
 
-Read this before enabling flags.
+**`nian-workspace` is not an OS sandbox.** Read this before enabling `--write`, `--exec`, or `--allow-shell`.
 
-- **`nian-workspace` is not an OS sandbox.** Workspace isolation prevents *filesystem tools* from addressing paths outside the configured root; command execution runs real local processes with the full permissions of your OS user. A spawned command can access files outside the workspace, use the network, and spawn descendants; it receives arbitrary arguments, and its stdout/stderr is unsanitized program output that may contain absolute host paths or sensitive local data — this applies in registry mode too, where only `run_command`'s `cwd` is workspace-restricted while the spawned program itself is not sandboxed. Enable `--exec` (or a workspace's `exec = true` in registry mode) only for MCP clients you trust.
-- **Workspace isolation** covers every filesystem-facing tool (`list_files`, `read_file`, `search`, `apply_patch`, `run_command` cwd, `git_diff` path). Requests containing `../` traversal, absolute paths outside the root, drive-letter tricks, or symlinks that resolve outside the root are rejected with explicit errors — including paths whose final component does not exist yet.
-- **Registry mode is startup-configured with per-workspace capabilities.** MCP requests select workspaces by operator-configured logical ID — never by path — and server-generated registry metadata and errors never contain filesystem roots or the configuration path; workspace responses carry the logical ID as provenance instead. Registry tools go through the same hardened workspace resolver as single-workspace mode, and registry Git output stays scoped to the selected workspace even when a larger parent repository is discovered. `apply_patch` requires the selected workspace's `write` capability and `run_command` its `exec` capability (`shell = true` additionally requires `allow_shell`), each enforced before anything is parsed or spawned. Tools not registered on a mode's router are not merely hidden from `tools/list`: they are rejected inside the router as `tool not found`, before any handler or workspace is touched.
-- **`--allow-shell` is a separate flag because shell execution is strictly more dangerous**: `/bin/sh` (Unix) or `cmd.exe` (Windows) interprets the whole command line, enabling chaining, redirection, and expansion. It also requires `--exec`.
+- **Filesystem tools are restricted to the configured roots.** `list_files`, `read_file`, `search`, `apply_patch`, `run_command`'s working directory, and `git_diff` path filters reject `../` traversal, absolute paths outside the root, and symlinks that resolve outside it.
+- **Command execution runs real local processes** with your OS user's full permissions. A spawned command can access files outside the workspace, use the network, and spawn descendants. Enable `exec`/`write`/`shell` only for MCP clients you trust.
+- **`allow_shell` is a separate, stronger capability** because the shell (`/bin/sh` on Unix, `cmd.exe` on Windows) interprets the entire command line, enabling chaining, redirection, and expansion. It requires `exec`.
+- **HTTP mode is loopback-only.** Non-loopback bind addresses are rejected at startup: there is no authentication layer, so anything that can reach the port can use the enabled tools against your filesystem.
 - **Outputs are bounded** (~256 KiB per channel by default) with truncation metadata, so large logs and dumps cannot flood model context.
-- **HTTP mode is loopback-only.** Non-loopback bind addresses (`0.0.0.0`, LAN IPs) are rejected at startup: there is no authentication layer, so anything that can reach the port can use the enabled tools against your filesystem. For remote access, put an external secure tunnel (TLS/auth) in front of `127.0.0.1`.
-- **Command output is truly bounded**: stdout/stderr are retained up to their caps and everything past them is discarded in fixed-size chunks; a timeout terminates the entire process tree (process group on Unix, Job Object on Windows), best-effort.
-- **Git tools are hardened for read-only use**: `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_EXTERNAL_DIFF` and similar environment redirection is stripped per invocation, pagers are disabled, and repository- or user-configured external diff, textconv, and fsmonitor execution paths are turned off (`--no-ext-diff`, `--no-textconv`, `-c core.fsmonitor=false`).
 
-No security guarantees beyond these mechanisms are made. Do not overstate them in deployments.
+No security guarantees beyond these mechanisms are made. The full security model — filesystem boundary internals, the command-execution threat model, and Git hardening — is in [docs/security.md](docs/security.md).
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [docs/configuration.md](docs/configuration.md) | Registry format, workspace IDs, root validation, permissions, single vs registry mode |
+| [docs/tools.md](docs/tools.md) | Complete MCP tool reference: schemas, outputs, provenance |
+| [docs/security.md](docs/security.md) | Filesystem boundary model, command-execution threat model, hardening details |
+| [docs/architecture.md](docs/architecture.md) | Bridge-not-agent design, server modes, transports, design invariants |
+| [docs/development.md](docs/development.md) | Local development, Rust toolchain, CI |
+| [docs/release.md](docs/release.md) | Release pipeline, platforms, artifacts |
+| [RELEASE_NOTES.md](RELEASE_NOTES.md) | Release history |
 
 ## Development
+
+Local quality gates:
 
 ```bash
 cargo fmt --all --check
@@ -338,25 +266,7 @@ cargo test
 cargo build --release
 ```
 
-CI runs the same gates on Forgejo (see `.forgejo/workflows/quality.yml`), pinned to Rust 1.98.0 in a Linux container — matching `rust-toolchain.toml`, so local builds and CI use the same toolchain. Release packaging is a separate pipeline (`.github/workflows/release.yml`) that runs only when a `v*` tag is pushed, and never on ordinary development pushes or pull requests — see [Platform support and CI honesty](#platform-support-and-ci-honesty).
-
-### Platform support and CI honesty
-
-CI is split by what each system can genuinely do:
-
-**Development CI — Forgejo Actions / DinD.** Ordinary pushes and pull requests run on the Linux x86_64 Docker runner (`.forgejo/workflows/quality.yml`): fmt, clippy, tests, a native Linux x86_64 release build, and foreign-target `cargo check` compile validation for Windows MSVC, both macOS targets, and Linux ARM64. Cross-target jobs are compile validation only — no foreign binary is executed, and no Windows/macOS release artifacts are produced here.
-
-**Release builds — GitHub Actions, tag-triggered only.** `.github/workflows/release.yml` runs only when a `v*` tag is pushed — it has no branch, pull request, scheduled, or manual trigger — so GitHub-hosted Windows/macOS/Linux native runners are consumed only at release time, never on ordinary development pushes. A lightweight consistency job runs first and fails the run before the expensive native matrix if the tag does not match the Cargo.toml package version or `RELEASE_NOTES.md` is not headed with the same version. Each release target then builds on a native GitHub-hosted runner of the matching architecture — each entry lists its runner, Rust target, binary, and archive format:
-
-| Platform | Rust target | Native runner | Release validation | Release artifact |
-|---|---|---|---|---|
-| Linux x86_64 | `x86_64-unknown-linux-gnu` | `ubuntu-24.04` | `cargo test --locked`, release build, binary smoke test on the runner | `nian-workspace-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 | `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm` | Same, on a native ARM64 Linux runner | `nian-workspace-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz` |
-| Windows x86_64 | `x86_64-pc-windows-msvc` | `windows-2025` | Same, natively under MSVC | `nian-workspace-vX.Y.Z-x86_64-pc-windows-msvc.zip` |
-| macOS x86_64 | `x86_64-apple-darwin` | `macos-15-intel` | Same, on an Intel macOS runner | `nian-workspace-vX.Y.Z-x86_64-apple-darwin.tar.gz` |
-| macOS arm64 | `aarch64-apple-darwin` | `macos-15` | Same, on an Apple Silicon runner | `nian-workspace-vX.Y.Z-aarch64-apple-darwin.tar.gz` |
-
-Each archive contains the binary, `README.md`, `LICENSE`, and `RELEASE_NOTES.md` inside a top-level `nian-workspace-vX.Y.Z-<target>/` directory. One authoritative `SHA256SUMS` file covering all five archives is generated and verified centrally before publication, and the GitHub Release body comes from `RELEASE_NOTES.md`. A native test failure on any platform blocks the release — failing native tests are not disabled to produce an artifact.
+Development changes are validated by CI, and tagged releases are built and tested natively for all supported platforms — see [docs/development.md](docs/development.md) and [docs/release.md](docs/release.md).
 
 ## License
 
