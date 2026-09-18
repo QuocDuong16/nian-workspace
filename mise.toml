@@ -1,0 +1,8 @@
+# Rust-only workspace: keep this pin in sync with rust-toolchain.toml,
+# Cargo.toml and the CI/release workflows.
+[settings]
+lockfile = true
+
+[tools]
+rust = "1.98.1"
+

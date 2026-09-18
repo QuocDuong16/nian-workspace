@@ -9,7 +9,14 @@ Notes for working on `nian-workspace` itself. For using it, start with the [READ
 
 ## Toolchain
 
-Rust 1.98 or newer is required to build from source. The exact toolchain is pinned in [`rust-toolchain.toml`](../rust-toolchain.toml) (currently 1.98.0, with `rustfmt` and `clippy`), so `cargo` commands automatically use the same version locally and in CI.
+Rust 1.98.1 or newer is required to build from source. For reproducible development, [`mise.toml`](../mise.toml) and [`mise.lock`](../mise.lock) pin Rust 1.98.1, matching [`rust-toolchain.toml`](../rust-toolchain.toml) (with `rustfmt` and `clippy`). Direct `cargo` commands also select this version through rustup.
+
+```bash
+mise trust
+mise install --locked rust
+```
+
+Only Rust is declared in the project-level mise configuration. Forgejo CI installs Node 26.9.0 solely to run JavaScript-based actions; neither Node nor pnpm is a build dependency of this Rust project. To refresh the tool lock after updating the Rust pin, run `mise lock`.
 
 No system libraries are required: the project has no TLS or other C dependencies.
 
@@ -51,7 +58,7 @@ Ordinary development changes are validated by CI on every push and pull request.
 
 What it runs, in two jobs:
 
-1. **`rust`** — fmt check, clippy (`-D warnings`), the full test suite, and a native Linux x86_64 release build, inside a `rust:1.98.0-bookworm` container matching the pinned toolchain. The runner container ships without Node.js, so the workflow first installs a pinned, checksum-verified Node.js runtime for the checkout action; the buildpack-deps base image otherwise provides everything needed.
+1. **`rust`** — fmt check, clippy (`-D warnings`), the full test suite, and a native Linux x86_64 release build, inside a `rust:1.98.1-bookworm` container matching the pinned toolchain. The runner container ships without Node.js, so the workflow first installs a pinned, checksum-verified Node.js 26.9.0 runtime for the checkout action; the buildpack-deps base image otherwise provides everything needed.
 2. **`cross-target`** — compile validation (`cargo check --all-targets --all-features`) for `x86_64-pc-windows-msvc`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, and `aarch64-unknown-linux-gnu` (after `rustup target add`). Cross-target jobs are **compile-only**: no foreign binary is executed and no emulators are used. They catch unguarded platform-specific code and target-specific dependency errors; native runtime testing for foreign platforms happens only at release time (see [release](release.md)).
 
 Release builds are deliberately not part of development CI — see [release.md](release.md) for the tag-triggered pipeline.

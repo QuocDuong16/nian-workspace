@@ -2,7 +2,7 @@
 name = "nian-workspace"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.98"
+rust-version = "1.98.1"
 description = "A secure local workspace bridge for web-hosted AI clients using MCP."
 license = "MIT"
 readme = "README.md"

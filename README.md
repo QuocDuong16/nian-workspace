@@ -69,11 +69,13 @@ Each archive contains the binary plus `README.md`, `LICENSE`, and `RELEASE_NOTES
 
 ### Build from source
 
-Building from source requires a Rust toolchain; Rust 1.98 or newer is supported (pinned in [`rust-toolchain.toml`](rust-toolchain.toml)).
+Building from source requires Rust 1.98.1 or newer. The exact development toolchain is pinned in [`mise.toml`](mise.toml), [`mise.lock`](mise.lock), and [`rust-toolchain.toml`](rust-toolchain.toml).
 
 ```bash
 git clone https://github.com/QuocDuong16/nian-workspace.git
 cd nian-workspace
+mise trust
+mise install --locked rust
 
 # Install into Cargo's binary directory (normally ~/.cargo/bin).
 cargo install --path . --locked
