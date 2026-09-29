@@ -1,0 +1,7 @@
+# Project map and invariants
+
+- `nian-workspace` is a local MCP capability bridge, not an AI agent. The client chooses actions; the operator fixes roots and permissions at startup.
+- Startup selects exactly one mode: `SingleWorkspace` from a positional root (default: current directory), or an immutable TOML workspace registry. Registry requests select by exact logical ID; there is no current-workspace state, reload, or runtime registration.
+- Source map: `src/main.rs` wires CLI, mode, and transport; `cli.rs` validates options; `config.rs` builds runtime state; `registry.rs` validates the registry; `workspace.rs` owns path resolution; `server/` contains mode-specific MCP routers; `tools/` contains shared tool behavior; `transport/` contains stdio and HTTP; `process/` contains Unix/Windows process-tree handling; integration fixtures/tests are under `tests/`.
+- Both server modes share context-based tool cores. Mode wrappers select a workspace, gate permissions, and apply the mode's path-presentation contract.
+- Read `mem:security/core` for the filesystem, permissions, command-execution, HTTP, and output-boundary invariants. Read `mem:tech_stack`, `mem:suggested_commands`, `mem:conventions`, and `mem:task_completion` for tooling and contribution workflow.

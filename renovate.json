@@ -1,0 +1,54 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "pinDigests": true,
+  "timezone": "Asia/Ho_Chi_Minh",
+  "enabledManagers": ["cargo", "mise", "github-actions"],
+  "labels": ["dependencies"],
+  "dependencyDashboard": true,
+  "dependencyDashboardOSVVulnerabilitySummary": "unresolved",
+  "osvVulnerabilityAlerts": true,
+  "prConcurrentLimit": 3,
+  "prHourlyLimit": 1,
+  "commitHourlyLimit": 2,
+  "packageRules": [
+    {
+      "description": "Require dashboard approval for major upgrades.",
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Wait seven days before Cargo minor updates.",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor"],
+      "minimumReleaseAge": "7 days"
+    },
+    {
+      "description": "Wait three days before Cargo patch updates.",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["patch"],
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Update Rust crates on Tuesdays.",
+      "matchManagers": ["cargo"],
+      "schedule": ["* * * * 2"]
+    },
+    {
+      "description": "Update GitHub and Forgejo Actions on Saturdays.",
+      "matchManagers": ["github-actions"],
+      "schedule": ["* * * * 6"]
+    },
+    {
+      "description": "Keep the Rust toolchain pin coordinated across mise, Cargo, rust-toolchain.toml, and CI; update it manually.",
+      "matchManagers": ["mise"],
+      "matchDepNames": ["rust"],
+      "enabled": false
+    },
+    {
+      "description": "Update mise-managed development tools on Saturdays.",
+      "matchManagers": ["mise"],
+      "schedule": ["* * * * 6"]
+    }
+  ]
+}
