@@ -13,12 +13,15 @@ CROSS_TARGETS ?= \
 .PHONY: help toolchain-install format format-check clippy test audit outdated build quality-check check \
 	cross-check ci-check run install clean
 
-help: ## List available commands
-	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z0-9_.-]+:.*##/ {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+##@ Getting started
+help: ## Show the documented Make targets
+	@awk 'BEGIN { FS = ":.*##"; printf "Usage: make <target> [VAR=value...]\n" } /^##@/ { if (shown++) printf "\n"; printf "%s\n", substr($$0, 5); next } /^[a-zA-Z0-9_.-]+:.*##/ { printf "  \033[36m%-32s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
+##@ Toolchain
 toolchain-install: ## Install Rust and Cargo tools pinned by mise
 	$(MISE) install --locked rust cargo:cargo-audit cargo:cargo-outdated
 
+##@ Rust workspace
 format: ## Format Rust sources
 	$(CARGO) fmt --all
 
@@ -40,6 +43,7 @@ outdated: ## List newer versions of direct dependencies
 build: ## Build the optimized release binary
 	$(CARGO) build --release
 
+##@ Quality and cross-target checks
 quality-check: format-check clippy test build ## Run the native quality gates used by CI
 
 check: quality-check ## Alias for quality-check
@@ -54,11 +58,13 @@ cross-check: ## Compile-check the CI targets (installs their Rust standard libra
 
 ci-check: quality-check cross-check ## Run native and cross-target CI checks locally
 
+##@ CLI and installation
 run: ## Run the CLI (pass arguments with ARGS="...")
 	$(CARGO) run -- $(ARGS)
 
 install: ## Install the binary from this checkout
 	$(CARGO) install --path . --locked
 
+##@ Cleanup
 clean: ## Remove Cargo build artifacts
 	$(CARGO) clean

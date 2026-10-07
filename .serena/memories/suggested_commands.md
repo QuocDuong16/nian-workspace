@@ -11,5 +11,6 @@
 - Run the local HTTP transport: `cargo run -- . --transport http --host 127.0.0.1 --port 8787`. Keep HTTP on loopback; it has no authentication.
 - Install the binary locally: `make install` (`cargo install --path . --locked`).
 - Build an optimized binary: `cargo build --release --locked`.
+- `make clean` removes Cargo build artifacts.
 - After changing a mise tool pin, refresh the lock with `mise lock`.
 - For the required local quality gates, see `mem:task_completion`.
