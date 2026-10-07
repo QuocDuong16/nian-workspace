@@ -14,7 +14,7 @@ jobs:
     runs-on: docker
     timeout-minutes: 60
     container:
-      image: rust:1.98.1-bookworm
+      image: rust:1.99.0-bookworm
 
     steps:
       # The runner container ships without Node.js, which node-based actions
@@ -78,7 +78,7 @@ jobs:
     timeout-minutes: 60
     needs: rust
     container:
-      image: rust:1.98.1-bookworm
+      image: rust:1.99.0-bookworm
 
     strategy:
       fail-fast: false

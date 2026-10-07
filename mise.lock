@@ -2,7 +2,17 @@
 
 lockfile_version = 1
 
+[[tools."cargo:cargo-audit"]]
+version = "0.22.2"
+backend = "cargo:cargo-audit"
+specifiers = ["0.22.2"]
+
+[[tools."cargo:cargo-outdated"]]
+version = "0.19.0"
+backend = "cargo:cargo-outdated"
+specifiers = ["0.19.0"]
+
 [[tools.rust]]
-version = "1.98.1"
+version = "1.99.0"
 backend = "core:rust"
-specifiers = ["1.98.1"]
+specifiers = ["1.99.0"]

@@ -16,7 +16,7 @@ use crate::tools::{
     command, error_result, files, git, patch, result_from_value, search, workspace_info,
 };
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 
 #[derive(Clone)]
@@ -145,8 +145,8 @@ impl NianWorkspaceServer {
 /// guidance in the error message when they call one that is unavailable.
 #[tool_handler(router = self.tool_router.clone())]
 impl ServerHandler for NianWorkspaceServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 crate::config::SERVER_NAME.to_string(),
                 crate::config::SERVER_VERSION.to_string(),

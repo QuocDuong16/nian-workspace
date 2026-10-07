@@ -2,7 +2,7 @@
 name = "nian-workspace"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.98.1"
+rust-version = "1.99.0"
 description = "A secure local workspace bridge for web-hosted AI clients using MCP."
 license = "MIT"
 readme = "README.md"
@@ -37,7 +37,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Registry-mode workspace configuration (v0.2): versioned TOML config file.
-toml = "0.9"
+toml = "1"
 # Registry root validation (v0.2): OS-level same-file identity (dev+inode on
 # Unix, volume serial + file index on Windows) so duplicate/nested root
 # detection never depends on path spelling or per-platform case folding.

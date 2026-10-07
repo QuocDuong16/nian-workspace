@@ -21,7 +21,7 @@ use crate::tools::{
     command, discovery, error_result, files, git, patch, result_from_value, search,
 };
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 
 /// MCP server for registry mode (v0.2 M5): discovery + per-workspace capability set.
@@ -160,8 +160,8 @@ impl RegistryServer {
 
 #[tool_handler(router = self.tool_router.clone())]
 impl ServerHandler for RegistryServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 crate::config::SERVER_NAME.to_string(),
                 crate::config::SERVER_VERSION.to_string(),
