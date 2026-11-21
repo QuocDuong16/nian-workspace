@@ -1,10 +1,10 @@
 # Release pipeline for nian-workspace.
 #
 # Trigger policy (hard requirement): this workflow runs ONLY on version tags
-# (v*). Ordinary branch pushes and pull requests are handled by Forgejo Actions
-# (.forgejo/workflows/quality.yml) and must never consume GitHub-hosted
-# release runners. There is deliberately no push.branches, pull_request,
-# schedule, or workflow_dispatch trigger here, to conserve hosted runner usage.
+# (v*). Ordinary branch pushes and pull requests have no CI and must never
+# consume GitHub-hosted release runners. There is deliberately no
+# push.branches, pull_request, schedule, or workflow_dispatch trigger here,
+# to conserve hosted runner usage.
 #
 # Native runner -> Rust target mapping (GitHub-hosted standard runners,
 # verified against actions/runner-images "Available Images" at release-prep

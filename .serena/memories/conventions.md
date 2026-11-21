@@ -6,4 +6,4 @@
 - Registry config is strict and fail-closed: unknown fields, invalid IDs, unsupported versions, unsafe roots, and invalid permission combinations abort startup.
 - Perform capability checks before parsing inputs that could cause side effects, touching files, or spawning processes. Read is implicit; write, direct execution, and shell execution are explicit.
 - Keep outputs bounded and report truncation. Registry responses use workspace-relative paths and must not disclose canonical roots; single-workspace mode retains absolute-path presentation for compatibility.
-- The toolchain pin is coordinated across Cargo, rustup, mise, and workflows. Renovate handles Cargo dependencies and workflow actions; the mise Rust runtime pin stays manual.
+- The toolchain pin is coordinated across Cargo, rustup, mise, and the release workflow; update it manually along with other dependencies.

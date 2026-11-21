@@ -253,7 +253,7 @@ No security guarantees beyond these mechanisms are made. The full security model
 | [docs/tools.md](docs/tools.md) | Complete MCP tool reference: schemas, outputs, provenance |
 | [docs/security.md](docs/security.md) | Filesystem boundary model, command-execution threat model, hardening details |
 | [docs/architecture.md](docs/architecture.md) | Bridge-not-agent design, server modes, transports, design invariants |
-| [docs/development.md](docs/development.md) | Local development, Rust toolchain, CI |
+| [docs/development.md](docs/development.md) | Local development, Rust toolchain, quality gates |
 | [docs/release.md](docs/release.md) | Release pipeline, platforms, artifacts |
 | [RELEASE_NOTES.md](RELEASE_NOTES.md) | Release history |
 
@@ -268,7 +268,7 @@ cargo test
 cargo build --release
 ```
 
-Development changes are validated by CI, and tagged releases are built and tested natively for all supported platforms — see [docs/development.md](docs/development.md) and [docs/release.md](docs/release.md).
+Development changes are validated locally with `make ci-check`, and tagged releases are built and tested natively for all supported platforms — see [docs/development.md](docs/development.md) and [docs/release.md](docs/release.md).
 
 ## License
 

@@ -10,7 +10,7 @@ How tagged releases of `nian-workspace` are built and published.
 
 ## Trigger policy
 
-Release builds run on **GitHub Actions, triggered only by a `v*` tag push**. The workflow has deliberately no branch, pull-request, scheduled, or manual trigger, so GitHub-hosted native runners are consumed only at release time — never on ordinary development pushes, which are handled by the [development CI](development.md#development-ci) instead.
+Release builds run on **GitHub Actions, triggered only by a `v*` tag push**. The workflow has deliberately no branch, pull-request, scheduled, or manual trigger, so GitHub-hosted native runners are consumed only at release time — never on ordinary development pushes or pull requests, which are validated locally instead.
 
 ## Tag/version/notes verification
 

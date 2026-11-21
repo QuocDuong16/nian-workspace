@@ -5,7 +5,7 @@ Notes for working on `nian-workspace` itself. For using it, start with the [READ
 - [Toolchain](#toolchain)
 - [Local quality gates](#local-quality-gates)
 - [Project layout](#project-layout)
-- [Development CI](#development-ci)
+- [Continuous integration](#continuous-integration)
 
 ## Toolchain
 
@@ -16,19 +16,19 @@ mise trust
 make toolchain-install
 ```
 
-The project-level mise configuration pins Rust plus the `cargo-audit` and `cargo-outdated` developer tools. `make toolchain-install` installs all three. Forgejo CI installs Node 26.9.0 solely to run JavaScript-based actions; neither Node nor pnpm is a build dependency of this Rust project. To refresh the tool lock after changing a pin, run `mise lock`.
+The project-level mise configuration pins Rust plus the `cargo-audit` and `cargo-outdated` developer tools. `make toolchain-install` installs all three. Neither Node nor pnpm is a build dependency of this Rust project. To refresh the tool lock after changing a pin, run `mise lock`.
 
 No system libraries are required: the project has no TLS or other C dependencies.
 
 ## Local quality gates
 
-The Makefile is the local entry point. Run `make help` to see all commands and `make quality-check` to run the native gates from CI:
+The Makefile is the local entry point. Run `make help` to see all commands and `make quality-check` to run the native gates:
 
 ```bash
 make quality-check
 ```
 
-The individual gates are `make format-check`, `make clippy`, `make test`, and `make build`. Clippy runs with warnings denied — new lints can break the build, which is intended. Run `make audit` to check the lockfile against the RustSec advisory database and `make outdated` to list newer direct dependency versions. These dependency reports are separate from the native quality gates. `make cross-check` installs the CI target standard libraries and runs compile-only checks for Windows, macOS, and Linux ARM64; `make ci-check` runs both the native and cross-target gates.
+The individual gates are `make format-check`, `make clippy`, `make test`, and `make build`. Clippy runs with warnings denied — new lints can break the build, which is intended. Run `make audit` to check the lockfile against the RustSec advisory database and `make outdated` to list newer direct dependency versions. These dependency reports are separate from the native quality gates. `make cross-check` installs the target standard libraries and runs compile-only checks for Windows, macOS, and Linux ARM64; `make ci-check` runs both the native and cross-target gates.
 
 ## Project layout
 
@@ -49,13 +49,17 @@ src/
 tests/             integration tests (CLI, HTTP, common fixtures)
 ```
 
-## Development CI
+## Continuous integration
 
-Ordinary development changes are validated by CI on every push and pull request. The development CI runs on a self-hosted Forgejo instance using Forgejo Actions with Docker-in-Docker (`.forgejo/workflows/quality.yml`) — this is maintainer infrastructure and irrelevant to using the product.
+There is no push- or pull-request CI for development changes. Run the gates locally before merging:
 
-What it runs, in two jobs:
+```bash
+make ci-check
+```
 
-1. **`rust`** — fmt check, clippy (`-D warnings`), the full test suite, and a native Linux x86_64 release build, inside a `rust:1.99.0-bookworm` container matching the pinned toolchain. The runner container ships without Node.js, so the workflow first installs a pinned, checksum-verified Node.js 26.9.0 runtime for the checkout action; the buildpack-deps base image otherwise provides everything needed.
-2. **`cross-target`** — compile validation (`cargo check --all-targets --all-features`) for `x86_64-pc-windows-msvc`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, and `aarch64-unknown-linux-gnu` (after `rustup target add`). Cross-target jobs are **compile-only**: no foreign binary is executed and no emulators are used. They catch unguarded platform-specific code and target-specific dependency errors; native runtime testing for foreign platforms happens only at release time (see [release](release.md)).
+`make ci-check` runs both sets of checks:
 
-Release builds are deliberately not part of development CI — see [release.md](release.md) for the tag-triggered pipeline.
+1. **Native gates** (`make quality-check`) — fmt check, clippy (`-D warnings`), the full test suite, and a native release build using the pinned Rust toolchain.
+2. **Cross-target checks** (`make cross-check`) — compile validation (`cargo check --all-targets --all-features`) for `x86_64-pc-windows-msvc`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, and `aarch64-unknown-linux-gnu` (after `rustup target add`). Cross-target checks are **compile-only**: no foreign binary is executed and no emulators are used. They catch unguarded platform-specific code and target-specific dependency errors; native runtime testing for foreign platforms happens only at release time (see [release](release.md)).
+
+Release builds run only on `v*` tags via GitHub Actions — see [release.md](release.md) for the tag-triggered pipeline.

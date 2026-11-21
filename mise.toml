@@ -1,5 +1,5 @@
 # Pin the Rust toolchain and Cargo developer utilities.
-# Keep the Rust version in sync with rust-toolchain.toml, Cargo.toml and CI.
+# Keep the Rust version in sync with rust-toolchain.toml, Cargo.toml and the release workflow.
 [settings]
 lockfile = true
 
